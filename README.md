@@ -20,7 +20,7 @@ applications with a strong focus on extractor-based rate limits.
 Here is a basic example showing how to use the crate with Axum routes:
 
 ```rust
-use your_crate::{Limit, LimitState, LimitPerSecond};
+use axum_limit::{Limit, LimitState, LimitPerSecond};
 use axum::{Router, routing::get};
 
 async fn route_handler(_: LimitPerSecond<5, Uri>) -> impl IntoResponse {
