@@ -103,8 +103,9 @@ dependencies = [
 
 [[package]]
 name = "axum-limit"
-version = "0.1.0"
+version = "0.1.0-alpha"
 dependencies = [
+ "anyhow",
  "async-trait",
  "axum",
  "axum-core",
@@ -112,6 +113,7 @@ dependencies = [
  "dashmap",
  "futures",
  "http 1.1.0",
+ "serde",
  "tokio",
 ]
 

@@ -1,19 +1,36 @@
 [package]
 name = "axum-limit"
-version = "0.1.0"
+version = "0.1.0-alpha"
+description = "A rate limiting library using token buckets, centered around extractor-based limits for async web applications."
+authors = ["GengTeng <me@gteng.org>"]
+license = "MIT"
+homepage = "https://github.com/gengteng/axum-limit"
+repository = "https://github.com/gengteng/axum-limit"
+documentation = "https://docs.rs/axum-limit"
+keywords = [
+    "axum",
+    "limit",
+    "extractor",
+    "rate",
+]
+categories = [
+    "asynchronous",
+    "network-programming",
+    "web-programming",
+]
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 async-trait = "0.1.80"
 axum-core = "0.4.3"
-axum-test = "14.8.0"
 dashmap = "5.5.3"
 http = "1.1.0"
-tokio = { version = "1.37.0", features = ["sync"] }
+
 
 [dev-dependencies]
+anyhow = "1.0.82"
 axum = "0.7.5"
 futures = "0.3.30"
+axum-test = "14.8.0"
 tokio = { version = "1.37.0", features = ["macros", "rt-multi-thread"] }
+serde = { version = "1.0.198", features = ["derive"] }
