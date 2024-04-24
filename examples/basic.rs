@@ -1,10 +1,7 @@
-use axum::extract::rejection::PathRejection;
 use axum::extract::Path;
 use axum::routing::get;
 use axum::Router;
-use axum_core::extract::FromRequestParts;
 use axum_limit::{Key, Limit, LimitPerDay, LimitPerHour, LimitPerSecond, LimitState};
-use http::request::Parts;
 use http::{Method, Uri};
 use serde::Deserialize;
 use std::hash::Hash;
@@ -60,19 +57,6 @@ struct Data {
 
 #[derive(Deserialize, Clone, Copy, Hash, Ord, PartialOrd, Eq, PartialEq, Debug)]
 struct Id(usize);
-
-#[async_trait::async_trait]
-impl<S> FromRequestParts<S> for Data
-where
-    S: Send + Sync,
-{
-    type Rejection = PathRejection;
-
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let path = Path::<Data>::from_request_parts(parts, state).await?;
-        Ok(path.0)
-    }
-}
 
 impl Key for Id {
     type Extractor = Path<Data>;
