@@ -17,10 +17,6 @@ applications with a strong focus on extractor-based rate limits.
 - Easily integrates with Axum, using extractors to apply rate limits seamlessly within your application routes.
 - Utilizes `DashMap` for concurrent state management across asynchronous tasks.
 
-## Usage
-
-To integrate this crate into your project, add it to your `Cargo.toml`:
-
 ## Example
 
 Here is a basic example showing how to use the crate with Axum routes:
