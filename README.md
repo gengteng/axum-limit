@@ -20,15 +20,16 @@ applications with a strong focus on extractor-based rate limits.
 Here is a basic example showing how to use the crate with Axum routes:
 
 ```rust
+use http::Uri;
 use axum_limit::{Limit, LimitState, LimitPerSecond};
-use axum::{Router, routing::get};
+use axum::{Router, routing::get, response::IntoResponse};
 
 async fn route_handler(_: LimitPerSecond<5, Uri>) -> impl IntoResponse {
     // Handler logic here, automatically enforcing the rate limit
 }
 
 fn main() {
-    let _app = Router::new()
+    let _app: Router<()> = Router::new()
         .route("/your_route", get(route_handler))
         .with_state(LimitState::<Uri>::default());
 }
