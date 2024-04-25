@@ -5,6 +5,7 @@
 [![LICENSE](https://img.shields.io/badge/license-MIT-blue)](https://github.com/gengteng/axum-limit/blob/main/LICENSE)
 [![dependency status](https://deps.rs/repo/github/gengteng/axum-limit/status.svg)](https://deps.rs/repo/github/gengteng/axum-limit)
 [![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/gengteng/axum-limit/.github/workflows/main.yml?branch=main)](https://github.com/gengteng/axum-limit/actions/workflows/ci.yml)
+
 This crate provides an efficient rate limiting mechanism using token buckets, specifically designed for asynchronous web
 applications with a strong focus on extractor-based rate limits.
 
