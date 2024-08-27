@@ -127,7 +127,7 @@ impl TokenBucket {
         Self {
             tokens: tokens.into(),
             last_refill_time: Instant::now(),
-            refill_duration: Duration::from_secs(per.into()),
+            refill_duration: Duration::from_millis(per.into()),
         }
     }
 
@@ -146,11 +146,19 @@ impl TokenBucket {
     fn refill(&mut self) {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_refill_time);
+
+        // Calculate the elapsed time in milliseconds
         if elapsed >= self.refill_duration {
-            let new_tokens = (elapsed.as_secs() / self.refill_duration.as_secs()) as usize;
+            let elapsed_millis = elapsed.as_millis() as u64; // Convert elapsed time to milliseconds
+            let refill_duration_millis = self.refill_duration.as_millis() as u64; // Convert refill duration to milliseconds
+
+            // Calculate the number of new tokens to add
+            let new_tokens = (elapsed_millis / refill_duration_millis) as usize;
             self.tokens += new_tokens;
+
+            // Reset the last refill time to avoid under-refilling tokens
             self.last_refill_time =
-                now - Duration::from_secs(elapsed.as_secs() % self.refill_duration.as_secs());
+                now - Duration::from_millis(elapsed_millis % refill_duration_millis);
         }
     }
 }
@@ -303,6 +311,34 @@ mod tests {
         );
         tokio::time::sleep(Duration::from_secs(1)).await;
         let response = server.get(TEST_ROUTE1).await;
+        assert_eq!(response.status_code(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn limit_per_100_millis() {
+        const TEST_ROUTE: &str = "/limit_per_100_millis";
+
+        async fn handler(Limit(_uri): Limit<1, 100, Uri>) -> impl IntoResponse {}
+
+        let my_app = Router::new()
+            .route(TEST_ROUTE, get(handler))
+            .with_state(LimitState::default());
+
+        let server = TestServer::new(my_app).expect("Failed to create test server");
+
+        // 第一次请求应该成功
+        let response = server.get(TEST_ROUTE).await;
+        assert_eq!(response.status_code(), StatusCode::OK);
+
+        // 马上再发起一次请求应该被限制
+        let response = server.get(TEST_ROUTE).await;
+        assert_eq!(response.status_code(), StatusCode::TOO_MANY_REQUESTS);
+
+        // 等待 100 毫秒
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // 再次请求应该成功
+        let response = server.get(TEST_ROUTE).await;
         assert_eq!(response.status_code(), StatusCode::OK);
     }
 }
