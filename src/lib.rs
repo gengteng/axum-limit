@@ -200,7 +200,6 @@ where
     }
 }
 
-#[async_trait::async_trait]
 impl<const C: usize, const P: u64, K, S> FromRequestParts<S> for Limit<C, P, K>
 where
     LimitState<K>: FromRef<S>,

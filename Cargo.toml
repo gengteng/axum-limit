@@ -22,16 +22,16 @@ edition = "2021"
 
 [dependencies]
 async-trait = "0.1.80"
-axum-core = "0.4.3"
+axum-core = "0.5.0"
 dashmap = "6.0.1"
 http = "1.1.0"
 
 
 [dev-dependencies]
 anyhow = "1.0.82"
-axum = "0.7.5"
+axum = "0.8.1"
 futures = "0.3.30"
-axum-test = "15.6.0"
+axum-test = "17.2.0"
 tokio = { version = "1.37.0", features = ["macros", "rt-multi-thread"] }
 serde = { version = "1.0.198", features = ["derive"] }
 http = "1.1.0"
