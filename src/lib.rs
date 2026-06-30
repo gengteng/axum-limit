@@ -117,17 +117,26 @@ pub trait Key: Eq + Hash + Send + Sync {
 /// This struct manages the tokens for rate limiting, providing methods to acquire and refill tokens based on time elapsed.
 struct TokenBucket {
     tokens: usize,
+    max_tokens: usize,
     last_refill_time: Instant,
-    refill_duration: Duration,
+    /// Nanoseconds required to generate one token.
+    ns_per_token: u64,
 }
 
 impl TokenBucket {
     /// Constructs a new `TokenBucket` with a specific number of tokens and a refill period.
-    fn new(tokens: impl Into<usize>, per: impl Into<u64>) -> Self {
+    ///
+    /// `count` is the bucket capacity and burst size. `per` is the period in milliseconds
+    /// over which `count` tokens are replenished.
+    fn new(count: usize, per: u64) -> Self {
+        let max_tokens = count.max(1);
+        let ns_per_token = (per.saturating_mul(1_000_000) / max_tokens as u64).max(1);
+
         Self {
-            tokens: tokens.into(),
+            tokens: max_tokens,
+            max_tokens,
             last_refill_time: Instant::now(),
-            refill_duration: Duration::from_millis(per.into()),
+            ns_per_token,
         }
     }
 
@@ -146,19 +155,13 @@ impl TokenBucket {
     fn refill(&mut self) {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_refill_time);
+        let elapsed_ns = elapsed.as_nanos() as u64;
 
-        // Calculate the elapsed time in milliseconds
-        if elapsed >= self.refill_duration {
-            let elapsed_millis = elapsed.as_millis() as u64; // Convert elapsed time to milliseconds
-            let refill_duration_millis = self.refill_duration.as_millis() as u64; // Convert refill duration to milliseconds
-
-            // Calculate the number of new tokens to add
-            let new_tokens = (elapsed_millis / refill_duration_millis) as usize;
-            self.tokens += new_tokens;
-
-            // Reset the last refill time to avoid under-refilling tokens
-            self.last_refill_time =
-                now - Duration::from_millis(elapsed_millis % refill_duration_millis);
+        if elapsed_ns >= self.ns_per_token {
+            let new_tokens = (elapsed_ns / self.ns_per_token) as usize;
+            self.tokens = (self.tokens + new_tokens).min(self.max_tokens);
+            let remainder_ns = elapsed_ns % self.ns_per_token;
+            self.last_refill_time = now - Duration::from_nanos(remainder_ns);
         }
     }
 }
@@ -340,5 +343,34 @@ mod tests {
         // 再次请求应该成功
         let response = server.get(TEST_ROUTE).await;
         assert_eq!(response.status_code(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn limit_per_second_allows_count_per_second() {
+        const ROUTE: &str = "/per_sec";
+        async fn handler(_: LimitPerSecond<5, Uri>) -> impl IntoResponse {}
+
+        let app = Router::new()
+            .route(ROUTE, get(handler))
+            .with_state(LimitState::default());
+
+        let server = TestServer::new(app).expect("server");
+
+        for _ in 0..5 {
+            assert_eq!(server.get(ROUTE).await.status_code(), StatusCode::OK);
+        }
+        assert_eq!(
+            server.get(ROUTE).await.status_code(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        for _ in 0..5 {
+            assert_eq!(server.get(ROUTE).await.status_code(), StatusCode::OK);
+        }
+        assert_eq!(
+            server.get(ROUTE).await.status_code(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
     }
 }
