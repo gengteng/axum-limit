@@ -1,5 +1,6 @@
 use super::{RateLimitPolicy, RateLimitState};
 use crate::quota::Quota;
+use crate::snapshot::RateLimitSnapshot;
 use std::time::{Duration, Instant};
 
 /// Token bucket rate limiting policy.
@@ -22,16 +23,12 @@ impl RateLimitPolicy for TokenBucketPolicy {
     type State = TokenBucketState;
 
     fn create_state(quota: Quota) -> Self::State {
-        TokenBucketState::new(quota)
+        TokenBucketState::new_at(quota, Instant::now())
     }
 }
 
 impl TokenBucketState {
-    fn new(quota: Quota) -> Self {
-        Self::new_at(quota, Instant::now())
-    }
-
-    fn new_at(quota: Quota, now: Instant) -> Self {
+    pub(crate) fn new_at(quota: Quota, now: Instant) -> Self {
         let max_tokens = quota.burst().max(1);
         let rate = quota.max.max(1);
         let ns_per_token = (quota.per_ms.saturating_mul(1_000_000) / rate as u64).max(1);
@@ -55,16 +52,36 @@ impl TokenBucketState {
             self.last_refill_time = now - Duration::from_nanos(remainder_ns);
         }
     }
+
+    fn next_token_at(&self, now: Instant) -> Instant {
+        if self.tokens > 0 {
+            now
+        } else {
+            now + Duration::from_nanos(self.ns_per_token)
+        }
+    }
 }
 
 impl RateLimitState for TokenBucketState {
-    fn try_acquire(&mut self, now: Instant) -> bool {
+    fn try_acquire(&mut self, now: Instant) -> RateLimitSnapshot {
         self.refill(now);
+        let limit = self.max_tokens;
+
         if self.tokens > 0 {
             self.tokens -= 1;
-            true
+            RateLimitSnapshot {
+                allowed: true,
+                limit,
+                remaining: self.tokens,
+                reset_at: self.next_token_at(now),
+            }
         } else {
-            false
+            RateLimitSnapshot {
+                allowed: false,
+                limit,
+                remaining: 0,
+                reset_at: self.next_token_at(now),
+            }
         }
     }
 }
@@ -87,9 +104,9 @@ mod tests {
         let mut bucket = bucket(Quota::with_burst(5, 1000, 10), start);
 
         for _ in 0..10 {
-            assert!(bucket.try_acquire(start));
+            assert!(bucket.try_acquire(start).allowed);
         }
-        assert!(!bucket.try_acquire(start));
+        assert!(!bucket.try_acquire(start).allowed);
     }
 
     #[test]
@@ -98,14 +115,13 @@ mod tests {
         let mut bucket = bucket(Quota::new(5, 1000), start);
 
         for _ in 0..5 {
-            assert!(bucket.try_acquire(start));
+            assert!(bucket.try_acquire(start).allowed);
         }
-        assert!(!bucket.try_acquire(start));
+        assert!(!bucket.try_acquire(start).allowed);
 
-        // One token every 200ms for 5 req/s.
-        assert!(!bucket.try_acquire(start + Duration::from_millis(199)));
-        assert!(bucket.try_acquire(start + Duration::from_millis(200)));
-        assert!(!bucket.try_acquire(start + Duration::from_millis(250)));
+        assert!(!bucket.try_acquire(start + Duration::from_millis(199)).allowed);
+        assert!(bucket.try_acquire(start + Duration::from_millis(200)).allowed);
+        assert!(!bucket.try_acquire(start + Duration::from_millis(250)).allowed);
     }
 
     #[test]
@@ -114,14 +130,14 @@ mod tests {
         let mut bucket = bucket(Quota::new(5, 1000), start);
 
         for _ in 0..5 {
-            assert!(bucket.try_acquire(start));
+            assert!(bucket.try_acquire(start).allowed);
         }
-        assert!(!bucket.try_acquire(start));
+        assert!(!bucket.try_acquire(start).allowed);
 
         for _ in 0..5 {
-            assert!(bucket.try_acquire(start + Duration::from_secs(1)));
+            assert!(bucket.try_acquire(start + Duration::from_secs(1)).allowed);
         }
-        assert!(!bucket.try_acquire(start + Duration::from_secs(1)));
+        assert!(!bucket.try_acquire(start + Duration::from_secs(1)).allowed);
     }
 
     #[test]
@@ -130,14 +146,13 @@ mod tests {
         let mut bucket = bucket(Quota::new(5, 1000), start);
 
         for _ in 0..5 {
-            assert!(bucket.try_acquire(start));
+            assert!(bucket.try_acquire(start).allowed);
         }
 
-        // Wait long enough to fully refill multiple times.
         for _ in 0..5 {
-            assert!(bucket.try_acquire(start + Duration::from_secs(10)));
+            assert!(bucket.try_acquire(start + Duration::from_secs(10)).allowed);
         }
-        assert!(!bucket.try_acquire(start + Duration::from_secs(10)));
+        assert!(!bucket.try_acquire(start + Duration::from_secs(10)).allowed);
     }
 
     #[test]
@@ -146,12 +161,11 @@ mod tests {
         let mut bucket = bucket(Quota::with_burst(2, 1000, 6), start);
 
         for _ in 0..6 {
-            assert!(bucket.try_acquire(start));
+            assert!(bucket.try_acquire(start).allowed);
         }
-        assert!(!bucket.try_acquire(start));
+        assert!(!bucket.try_acquire(start).allowed);
 
-        // Sustained rate is 2/s, so one token after 500ms.
-        assert!(bucket.try_acquire(start + Duration::from_millis(500)));
-        assert!(!bucket.try_acquire(start + Duration::from_millis(500)));
+        assert!(bucket.try_acquire(start + Duration::from_millis(500)).allowed);
+        assert!(!bucket.try_acquire(start + Duration::from_millis(500)).allowed);
     }
 }

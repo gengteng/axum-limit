@@ -1,7 +1,8 @@
+use std::hash::Hash;
 use std::time::Duration;
 
 /// Describes how many requests are allowed within a time period.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Quota {
     /// Maximum sustained requests allowed per [`Self::per`](Quota::per).
     pub max: usize,
@@ -64,4 +65,24 @@ impl Quota {
             None => self.max,
         }
     }
+
+    /// Returns a fingerprint used to isolate state for different quotas on the same key.
+    pub const fn fingerprint(self) -> QuotaFingerprint {
+        QuotaFingerprint {
+            max: self.max,
+            per_ms: self.per_ms,
+            burst: self.burst,
+        }
+    }
+}
+
+/// Identifies a unique quota configuration for per-key state lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct QuotaFingerprint {
+    /// Maximum sustained requests allowed per period.
+    pub max: usize,
+    /// Time period in milliseconds.
+    pub per_ms: u64,
+    /// Optional burst capacity.
+    pub burst: Option<usize>,
 }

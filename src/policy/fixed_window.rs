@@ -1,5 +1,6 @@
 use super::{RateLimitPolicy, RateLimitState};
 use crate::quota::Quota;
+use crate::snapshot::RateLimitSnapshot;
 use std::time::{Duration, Instant};
 
 /// Fixed window rate limiting policy.
@@ -22,16 +23,12 @@ impl RateLimitPolicy for FixedWindowPolicy {
     type State = FixedWindowState;
 
     fn create_state(quota: Quota) -> Self::State {
-        FixedWindowState::new(quota)
+        FixedWindowState::new_at(quota, Instant::now())
     }
 }
 
 impl FixedWindowState {
-    fn new(quota: Quota) -> Self {
-        Self::new_at(quota, Instant::now())
-    }
-
-    fn new_at(quota: Quota, now: Instant) -> Self {
+    pub(crate) fn new_at(quota: Quota, now: Instant) -> Self {
         Self {
             count: 0,
             window_start: now,
@@ -46,16 +43,32 @@ impl FixedWindowState {
             self.window_start = now;
         }
     }
+
+    fn reset_at(&self) -> Instant {
+        self.window_start + self.window_size
+    }
 }
 
 impl RateLimitState for FixedWindowState {
-    fn try_acquire(&mut self, now: Instant) -> bool {
+    fn try_acquire(&mut self, now: Instant) -> RateLimitSnapshot {
         self.maybe_reset_window(now);
-        if self.count < self.max {
+        let limit = self.max;
+
+        if self.count < limit {
             self.count += 1;
-            true
+            RateLimitSnapshot {
+                allowed: true,
+                limit,
+                remaining: limit.saturating_sub(self.count),
+                reset_at: self.reset_at(),
+            }
         } else {
-            false
+            RateLimitSnapshot {
+                allowed: false,
+                limit,
+                remaining: 0,
+                reset_at: self.reset_at(),
+            }
         }
     }
 }
@@ -77,10 +90,10 @@ mod tests {
         let start = at(0);
         let mut window = window(Quota::new(3, 1000), start);
 
-        assert!(window.try_acquire(start));
-        assert!(window.try_acquire(start + Duration::from_millis(100)));
-        assert!(window.try_acquire(start + Duration::from_millis(500)));
-        assert!(!window.try_acquire(start + Duration::from_millis(900)));
+        assert!(window.try_acquire(start).allowed);
+        assert!(window.try_acquire(start + Duration::from_millis(100)).allowed);
+        assert!(window.try_acquire(start + Duration::from_millis(500)).allowed);
+        assert!(!window.try_acquire(start + Duration::from_millis(900)).allowed);
     }
 
     #[test]
@@ -88,14 +101,13 @@ mod tests {
         let start = at(0);
         let mut window = window(Quota::new(2, 1000), start);
 
-        assert!(window.try_acquire(start));
-        assert!(window.try_acquire(start + Duration::from_millis(100)));
-        assert!(!window.try_acquire(start + Duration::from_millis(200)));
+        assert!(window.try_acquire(start).allowed);
+        assert!(window.try_acquire(start + Duration::from_millis(100)).allowed);
+        assert!(!window.try_acquire(start + Duration::from_millis(200)).allowed);
 
-        // New window begins at t=1000ms.
-        assert!(window.try_acquire(start + Duration::from_millis(1000)));
-        assert!(window.try_acquire(start + Duration::from_millis(1100)));
-        assert!(!window.try_acquire(start + Duration::from_millis(1200)));
+        assert!(window.try_acquire(start + Duration::from_millis(1000)).allowed);
+        assert!(window.try_acquire(start + Duration::from_millis(1100)).allowed);
+        assert!(!window.try_acquire(start + Duration::from_millis(1200)).allowed);
     }
 
     #[test]
@@ -103,11 +115,9 @@ mod tests {
         let start = at(0);
         let mut window = window(Quota::new(1, 500), start);
 
-        assert!(window.try_acquire(start));
-        assert!(!window.try_acquire(start + Duration::from_millis(100)));
-
-        // Exactly at boundary, counter resets.
-        assert!(window.try_acquire(start + Duration::from_millis(500)));
+        assert!(window.try_acquire(start).allowed);
+        assert!(!window.try_acquire(start + Duration::from_millis(100)).allowed);
+        assert!(window.try_acquire(start + Duration::from_millis(500)).allowed);
     }
 
     #[test]
@@ -115,8 +125,8 @@ mod tests {
         let start = at(0);
         let mut window = window(Quota::with_burst(2, 1000, 10), start);
 
-        assert!(window.try_acquire(start));
-        assert!(window.try_acquire(start));
-        assert!(!window.try_acquire(start));
+        assert!(window.try_acquire(start).allowed);
+        assert!(window.try_acquire(start).allowed);
+        assert!(!window.try_acquire(start).allowed);
     }
 }

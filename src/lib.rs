@@ -4,6 +4,7 @@
 mod key;
 mod policy;
 mod quota;
+mod snapshot;
 
 use axum_core::extract::{FromRef, FromRequestParts};
 use axum_core::response::{IntoResponse, Response};
@@ -18,8 +19,9 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::Instant;
 
-pub use policy::{FixedWindowPolicy, TokenBucketPolicy};
-pub use quota::Quota;
+pub use policy::{FixedWindowPolicy, SlidingWindowPolicy, TokenBucketPolicy};
+pub use quota::{Quota, QuotaFingerprint};
+pub use snapshot::{RateLimitInfo, RateLimitSnapshot};
 
 macro_rules! define_limit_extractor {
     (
@@ -127,10 +129,13 @@ macro_rules! define_limit_extractor {
 
                 let limit_state: LimitState<K, $policy> = FromRef::from_ref(state);
                 let key = K::from_extractor(&key_extractor);
-                if limit_state.check(key, Quota::new(C, P)) {
+                let snapshot = limit_state.check(key, Quota::new(C, P));
+
+                if snapshot.allowed {
+                    parts.extensions.insert(RateLimitInfo(snapshot));
                     Ok(Self(key_extractor))
                 } else {
-                    Err(LimitRejection::RateLimitExceeded)
+                    Err(LimitRejection::RateLimitExceeded(snapshot))
                 }
             }
         }
@@ -145,6 +150,11 @@ define_limit_extractor! {
 define_limit_extractor! {
     /// Fixed-window rate limit extractor.
     FixedWindowLimit => FixedWindowPolicy
+}
+
+define_limit_extractor! {
+    /// Sliding-window rate limit extractor.
+    SlidingWindowLimit => SlidingWindowPolicy
 }
 
 /// Token-bucket rate limit configured to apply per second.
@@ -171,6 +181,18 @@ pub type FixedWindowPerHour<const COUNT: usize, K> = FixedWindowLimit<COUNT, 3_6
 /// Fixed-window rate limit configured to apply per day.
 pub type FixedWindowPerDay<const COUNT: usize, K> = FixedWindowLimit<COUNT, 86_400_000, K>;
 
+/// Sliding-window rate limit configured to apply per second.
+pub type SlidingWindowPerSecond<const COUNT: usize, K> = SlidingWindowLimit<COUNT, 1000, K>;
+
+/// Sliding-window rate limit configured to apply per minute.
+pub type SlidingWindowPerMinute<const COUNT: usize, K> = SlidingWindowLimit<COUNT, 60_000, K>;
+
+/// Sliding-window rate limit configured to apply per hour.
+pub type SlidingWindowPerHour<const COUNT: usize, K> = SlidingWindowLimit<COUNT, 3_600_000, K>;
+
+/// Sliding-window rate limit configured to apply per day.
+pub type SlidingWindowPerDay<const COUNT: usize, K> = SlidingWindowLimit<COUNT, 86_400_000, K>;
+
 /// Trait defining the requirements for a key extractor, which is used to uniquely identify limit subjects
 /// and extract rate limit parameters dynamically in request processing.
 #[async_trait::async_trait]
@@ -181,6 +203,13 @@ pub trait Key: Eq + Hash + Send + Sync {
     fn from_extractor(extractor: &Self::Extractor) -> Self;
 }
 
+/// Composite key isolating per-subject state for each quota configuration.
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+struct LimitEntryKey<K> {
+    subject: K,
+    quota: QuotaFingerprint,
+}
+
 /// Manages per-key state for a specific [`RateLimitPolicy`].
 #[derive(Clone)]
 pub struct LimitState<K, P = TokenBucketPolicy>
@@ -188,7 +217,7 @@ where
     K: Key,
     P: RateLimitPolicy,
 {
-    rate_limits: Arc<DashMap<K, P::State>>,
+    rate_limits: Arc<DashMap<LimitEntryKey<K>, P::State>>,
 }
 
 impl<K, P> Default for LimitState<K, P>
@@ -208,11 +237,15 @@ where
     K: Key,
     P: RateLimitPolicy,
 {
-    /// Checks and updates the rate limit for the given key, returning `true` if the request can proceed.
-    pub fn check(&self, key: K, quota: Quota) -> bool {
+    /// Checks and updates the rate limit for the given key.
+    pub fn check(&self, key: K, quota: Quota) -> RateLimitSnapshot {
+        let entry_key = LimitEntryKey {
+            subject: key,
+            quota: quota.fingerprint(),
+        };
         let mut state = self
             .rate_limits
-            .entry(key)
+            .entry(entry_key)
             .or_insert_with(|| P::create_state(quota));
         state.try_acquire(Instant::now())
     }
@@ -225,14 +258,14 @@ pub enum LimitRejection<R> {
     KeyExtractionFailure(R),
 
     /// Indicates that the rate limit has been exceeded.
-    RateLimitExceeded,
+    RateLimitExceeded(RateLimitSnapshot),
 }
 
 impl<R: Display> Display for LimitRejection<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LimitRejection::KeyExtractionFailure(r) => write!(f, "{r}"),
-            LimitRejection::RateLimitExceeded => write!(f, "Rate limit exceeded."),
+            LimitRejection::RateLimitExceeded(_) => write!(f, "Rate limit exceeded."),
         }
     }
 }
@@ -241,7 +274,7 @@ impl<R: Error + 'static> Error for LimitRejection<R> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             LimitRejection::KeyExtractionFailure(ve) => Some(ve),
-            LimitRejection::RateLimitExceeded => None,
+            LimitRejection::RateLimitExceeded(_) => None,
         }
     }
 }
@@ -250,11 +283,25 @@ impl<R: IntoResponse> IntoResponse for LimitRejection<R> {
     fn into_response(self) -> Response {
         match self {
             LimitRejection::KeyExtractionFailure(rejection) => rejection.into_response(),
-            LimitRejection::RateLimitExceeded => {
-                (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded.").into_response()
+            LimitRejection::RateLimitExceeded(snapshot) => {
+                let now = Instant::now();
+                let mut response =
+                    (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded.").into_response();
+                response
+                    .headers_mut()
+                    .extend(snapshot.to_headers(now));
+                response
             }
         }
     }
+}
+
+/// Returns rate limit headers from request extensions when a limit check succeeded.
+pub fn rate_limit_headers_from_parts(parts: &Parts) -> Option<http::HeaderMap> {
+    parts
+        .extensions
+        .get::<RateLimitInfo>()
+        .map(|info| info.0.to_headers(Instant::now()))
 }
 
 #[cfg(test)]
@@ -388,5 +435,62 @@ mod tests {
             server.get(ROUTE).await.status_code(),
             StatusCode::TOO_MANY_REQUESTS
         );
+    }
+
+    #[tokio::test]
+    async fn sliding_window_limit_per_second() {
+        const ROUTE: &str = "/sliding_per_sec";
+        async fn handler(_: SlidingWindowPerSecond<3, Uri>) -> impl IntoResponse {}
+
+        let app = Router::new()
+            .route(ROUTE, get(handler))
+            .with_state(LimitState::<Uri, SlidingWindowPolicy>::default());
+
+        let server = TestServer::new(app).expect("server");
+
+        for _ in 0..3 {
+            assert_eq!(server.get(ROUTE).await.status_code(), StatusCode::OK);
+        }
+        assert_eq!(
+            server.get(ROUTE).await.status_code(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+
+        // Sliding windows need a full quiet period before the full quota returns.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        for _ in 0..3 {
+            assert_eq!(server.get(ROUTE).await.status_code(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limit_exceeded_includes_headers() {
+        const ROUTE: &str = "/headers";
+        async fn handler(_: LimitPerSecond<1, Uri>) -> impl IntoResponse {}
+
+        let app = Router::new()
+            .route(ROUTE, get(handler))
+            .with_state(LimitState::default());
+
+        let server = TestServer::new(app).expect("server");
+
+        assert_eq!(server.get(ROUTE).await.status_code(), StatusCode::OK);
+        let response = server.get(ROUTE).await;
+        assert_eq!(response.status_code(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().get("x-ratelimit-limit").is_some());
+        assert!(response.headers().get("retry-after").is_some());
+    }
+
+    #[test]
+    fn different_quotas_on_same_key_are_isolated() {
+        let state = LimitState::<Uri>::default();
+        let uri: Uri = "/test".parse().expect("valid uri");
+        let quota_a = Quota::new(1, 1000);
+        let quota_b = Quota::new(5, 1000);
+
+        assert!(state.check(uri.clone(), quota_a).allowed);
+        assert!(!state.check(uri.clone(), quota_a).allowed);
+        assert!(state.check(uri, quota_b).allowed);
     }
 }
