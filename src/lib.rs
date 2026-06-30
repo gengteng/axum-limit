@@ -357,9 +357,9 @@ mod tests {
     async fn token_bucket_limit() {
         const TEST_ROUTE0: &str = "/limit0";
         const TEST_ROUTE1: &str = "/limit1";
-        async fn handler0(Limit(_uri, _): Limit<1, 1, Uri>) -> impl IntoResponse {}
+        async fn handler0(Limit(_uri, _): LimitPerSecond<1, Uri>) -> impl IntoResponse {}
 
-        async fn handler1(Limit(_uri, _): Limit<3, 1, Uri>) -> impl IntoResponse {}
+        async fn handler1(Limit(_uri, _): LimitPerSecond<3, Uri>) -> impl IntoResponse {}
 
         let my_app = Router::new()
             .route(TEST_ROUTE0, get(handler0))
