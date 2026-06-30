@@ -1,3 +1,4 @@
+use crate::backend::StorageKey;
 use crate::Key;
 use http::{Method, Uri, Version};
 
@@ -9,6 +10,12 @@ impl Key for Uri {
     }
 }
 
+impl StorageKey for Uri {
+    fn storage_key(&self) -> String {
+        self.to_string()
+    }
+}
+
 impl Key for Method {
     type Extractor = Method;
 
@@ -17,11 +24,23 @@ impl Key for Method {
     }
 }
 
+impl StorageKey for Method {
+    fn storage_key(&self) -> String {
+        self.as_str().to_string()
+    }
+}
+
 impl Key for Version {
     type Extractor = Version;
 
     fn from_extractor(extractor: &Self::Extractor) -> Self {
         *extractor
+    }
+}
+
+impl StorageKey for Version {
+    fn storage_key(&self) -> String {
+        format!("{self:?}")
     }
 }
 
@@ -36,6 +55,17 @@ macro_rules! impl_key_for_tuple {
 
             fn from_extractor(($($name,)+): &Self::Extractor) -> Self {
                 ($($name::from_extractor($name),)+)
+            }
+        }
+
+        #[allow(non_snake_case)]
+        impl<$($name),+> StorageKey for ($($name,)+)
+        where
+            $($name: StorageKey,)+
+        {
+            fn storage_key(&self) -> String {
+                let ($($name,)+) = self;
+                vec![$($name.storage_key()),+].join("|")
             }
         }
     }
