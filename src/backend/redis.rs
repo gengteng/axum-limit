@@ -111,3 +111,44 @@ impl RateLimitBackend for RedisBackend {
         Err(BackendError::Contention)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::TokenBucketPolicy;
+    use crate::quota::Quota;
+
+    #[tokio::test]
+    #[ignore = "requires a running Redis server at redis://127.0.0.1/"]
+    async fn transact_persists_state() {
+        let backend = RedisBackend::connect("redis://127.0.0.1/")
+            .await
+            .expect("redis connection");
+        let storage_key = format!(
+            "test:{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        let quota = Quota::per_second(2);
+
+        let first = backend
+            .transact::<TokenBucketPolicy>(&storage_key, quota, 1_000_000)
+            .await
+            .expect("first transact");
+        assert!(first.allowed);
+
+        let second = backend
+            .transact::<TokenBucketPolicy>(&storage_key, quota, 1_000_000)
+            .await
+            .expect("second transact");
+        assert!(second.allowed);
+
+        let third = backend
+            .transact::<TokenBucketPolicy>(&storage_key, quota, 1_000_000)
+            .await
+            .expect("third transact");
+        assert!(!third.allowed);
+    }
+}

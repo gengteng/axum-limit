@@ -129,4 +129,52 @@ proptest! {
 
         prop_assert_eq!(allowed, max);
     }
+
+    #[test]
+    fn fixed_window_never_exceeds_max_within_each_window(
+        max in 1usize..20,
+        per_ms in 200u64..2000,
+        offsets in monotonic_offsets(80, 400),
+    ) {
+        let quota = Quota::new(max, per_ms);
+        let mut state = FixedWindowState::new_at(quota, BASE_MS);
+        let mut allowed_in_window = 0usize;
+        let mut reset_at = 0u64;
+
+        for offset in offsets {
+            let snapshot = state.try_acquire(BASE_MS + offset);
+            if reset_at != snapshot.reset_at_ms {
+                allowed_in_window = 0;
+                reset_at = snapshot.reset_at_ms;
+            }
+            if snapshot.allowed {
+                allowed_in_window += 1;
+            }
+            prop_assert!(allowed_in_window <= max);
+        }
+    }
+
+    #[test]
+    fn sliding_window_never_exceeds_max_within_each_window(
+        max in 1usize..20,
+        per_ms in 200u64..2000,
+        offsets in monotonic_offsets(80, 400),
+    ) {
+        let quota = Quota::new(max, per_ms);
+        let mut state = SlidingWindowState::new_at(quota, BASE_MS);
+        let mut allowed_in_window = 0usize;
+        let mut reset_at = 0u64;
+
+        for offset in offsets {
+            let snapshot = state.try_acquire(BASE_MS + offset);
+            if reset_at != snapshot.reset_at_ms {
+                allowed_in_window = 0;
+                reset_at = snapshot.reset_at_ms;
+            }
+            if snapshot.allowed {
+                allowed_in_window += 1;
+            }
+            prop_assert!(allowed_in_window <= max);
+        }
+    }
 }

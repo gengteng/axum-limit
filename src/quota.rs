@@ -86,3 +86,31 @@ pub struct QuotaFingerprint {
     /// Optional burst capacity.
     pub burst: Option<usize>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fingerprint_distinguishes_quotas() {
+        assert_ne!(
+            Quota::new(1, 1000).fingerprint(),
+            Quota::new(2, 1000).fingerprint()
+        );
+        assert_ne!(
+            Quota::new(5, 1000).fingerprint(),
+            Quota::new(5, 2000).fingerprint()
+        );
+        assert_ne!(
+            Quota::with_burst(5, 1000, 10).fingerprint(),
+            Quota::new(5, 1000).fingerprint()
+        );
+    }
+
+    #[test]
+    fn per_second_sets_one_second_period() {
+        let quota = Quota::per_second(10);
+        assert_eq!(quota.max, 10);
+        assert_eq!(quota.per_ms, 1000);
+    }
+}

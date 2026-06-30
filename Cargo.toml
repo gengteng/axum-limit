@@ -1,6 +1,6 @@
 [package]
 name = "axum-limit"
-version = "0.2.0-alpha.3"
+version = "0.1.0"
 description = "Production-oriented rate limiting for Axum via extractors, with pluggable algorithms and storage backends."
 authors = ["GengTeng <me@gteng.org>"]
 license = "MIT"

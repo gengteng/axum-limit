@@ -6,6 +6,7 @@ mod codec;
 mod key;
 mod policy;
 mod quota;
+mod quota_source;
 mod snapshot;
 mod time;
 
@@ -13,6 +14,7 @@ use axum_core::extract::{FromRef, FromRequestParts};
 use axum_core::response::{IntoResponse, Response};
 use http::request::Parts;
 use http::StatusCode;
+use std::convert::Infallible;
 use std::error::Error;
 use std::fmt::Display;
 use std::marker::PhantomData;
@@ -29,6 +31,7 @@ pub use policy::{
     FixedWindowPolicy, PolicyState, RateLimitPolicy, SlidingWindowPolicy, TokenBucketPolicy,
 };
 pub use quota::{Quota, QuotaFingerprint};
+pub use quota_source::{FixedQuota, QuotaSource};
 pub use snapshot::{RateLimitInfo, RateLimitSnapshot};
 
 macro_rules! define_limit_extractor {
@@ -183,6 +186,171 @@ define_limit_extractor! {
     SlidingWindowLimit => SlidingWindowPolicy
 }
 
+macro_rules! define_dynamic_limit_extractor {
+    (
+        $(#[$struct_meta:meta])*
+        $name:ident => $policy:ty
+    ) => {
+        $(#[$struct_meta])*
+        #[derive(Debug, Clone)]
+        pub struct $name<K, Q, B = MemoryBackend>(
+            pub K::Extractor,
+            pub Quota,
+            pub std::marker::PhantomData<(Q, B)>,
+        )
+        where
+            K: Key,
+            B: RateLimitBackend;
+
+        impl<K, Q, B> AsRef<K::Extractor> for $name<K, Q, B>
+        where
+            K: Key,
+            B: RateLimitBackend,
+        {
+            fn as_ref(&self) -> &K::Extractor {
+                &self.0
+            }
+        }
+
+        impl<K, Q, B> AsMut<K::Extractor> for $name<K, Q, B>
+        where
+            K: Key,
+            B: RateLimitBackend,
+        {
+            fn as_mut(&mut self) -> &mut K::Extractor {
+                &mut self.0
+            }
+        }
+
+        impl<K, Q, B> Deref for $name<K, Q, B>
+        where
+            K: Key,
+            B: RateLimitBackend,
+        {
+            type Target = K::Extractor;
+
+            fn deref(&self) -> &Self::Target {
+                &self.0
+            }
+        }
+
+        impl<K, Q, B> DerefMut for $name<K, Q, B>
+        where
+            K: Key,
+            B: RateLimitBackend,
+        {
+            fn deref_mut(&mut self) -> &mut Self::Target {
+                &mut self.0
+            }
+        }
+
+        impl<K, Q, B> Display for $name<K, Q, B>
+        where
+            K: Key,
+            B: RateLimitBackend,
+            K::Extractor: Display,
+        {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt(f)
+            }
+        }
+
+        impl<K, Q, B> $name<K, Q, B>
+        where
+            K: Key,
+            B: RateLimitBackend,
+        {
+            /// Returns the quota resolved for this request.
+            pub fn resolved_quota(&self) -> Quota {
+                self.1
+            }
+
+            /// Consumes the limit and returns the inner extractor and resolved quota.
+            pub fn into_parts(self) -> (K::Extractor, Quota) {
+                (self.0, self.1)
+            }
+
+            /// Consumes the limit and returns the inner extractor.
+            pub fn into_inner(self) -> K::Extractor {
+                self.0
+            }
+        }
+
+        impl<K, Q, B, S> FromRequestParts<S> for $name<K, Q, B>
+        where
+            B: RateLimitBackend,
+            B::Error: Display,
+            S: Send + Sync,
+            K: Key + StorageKey,
+            K::Extractor: FromRequestParts<S> + Send,
+            Q: QuotaSource<S>,
+            LimitState<K, $policy, B>: FromRef<S>,
+        {
+            type Rejection = LimitRejection<
+                <<K as Key>::Extractor as FromRequestParts<S>>::Rejection,
+                Q::Rejection,
+            >;
+
+            fn from_request_parts(
+                parts: &mut Parts,
+                state: &S,
+            ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send
+            where
+                S: Sync,
+            {
+                async move {
+                    let key_extractor = match K::Extractor::from_request_parts(parts, state).await {
+                        Ok(ke) => ke,
+                        Err(rejection) => {
+                            return Err(LimitRejection::KeyExtractionFailure(rejection));
+                        }
+                    };
+
+                    let quota = match Q::resolve(parts, state).await {
+                        Ok(quota) => quota,
+                        Err(rejection) => {
+                            return Err(LimitRejection::QuotaResolutionFailure(rejection));
+                        }
+                    };
+
+                    let limit_state: LimitState<K, $policy, B> = FromRef::from_ref(state);
+                    let key = K::from_extractor(&key_extractor);
+                    let snapshot = limit_state
+                        .check(key, quota)
+                        .await
+                        .map_err(|error| LimitRejection::Backend(error.to_string()))?;
+
+                    if snapshot.allowed {
+                        parts.extensions.insert(RateLimitInfo(snapshot));
+                        Ok(Self(
+                            key_extractor,
+                            quota,
+                            std::marker::PhantomData,
+                        ))
+                    } else {
+                        Err(LimitRejection::RateLimitExceeded(snapshot))
+                    }
+                }
+            }
+        }
+    };
+}
+
+define_dynamic_limit_extractor! {
+    /// Token-bucket rate limit extractor with a runtime [`QuotaSource`].
+    DynamicLimit => TokenBucketPolicy
+}
+
+define_dynamic_limit_extractor! {
+    /// Fixed-window rate limit extractor with a runtime [`QuotaSource`].
+    DynamicFixedWindowLimit => FixedWindowPolicy
+}
+
+define_dynamic_limit_extractor! {
+    /// Sliding-window rate limit extractor with a runtime [`QuotaSource`].
+    DynamicSlidingWindowLimit => SlidingWindowPolicy
+}
+
 /// Token-bucket rate limit configured to apply per second.
 pub type LimitPerSecond<const COUNT: usize, K, B = MemoryBackend> = Limit<COUNT, 1000, K, B>;
 
@@ -288,9 +456,12 @@ where
 
 /// Enumerates possible failure modes for rate limiting when extracting from request parts.
 #[derive(Debug)]
-pub enum LimitRejection<R> {
+pub enum LimitRejection<K, Q = Infallible> {
     /// Indicates a failure during key extraction, storing the underlying rejection reason.
-    KeyExtractionFailure(R),
+    KeyExtractionFailure(K),
+
+    /// Indicates that quota resolution failed.
+    QuotaResolutionFailure(Q),
 
     /// Indicates that the rate limit has been exceeded.
     RateLimitExceeded(RateLimitSnapshot),
@@ -299,29 +470,32 @@ pub enum LimitRejection<R> {
     Backend(String),
 }
 
-impl<R: Display> Display for LimitRejection<R> {
+impl<K: Display, Q: Display> Display for LimitRejection<K, Q> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LimitRejection::KeyExtractionFailure(r) => write!(f, "{r}"),
+            LimitRejection::QuotaResolutionFailure(r) => write!(f, "{r}"),
             LimitRejection::RateLimitExceeded(_) => write!(f, "Rate limit exceeded."),
             LimitRejection::Backend(message) => write!(f, "Rate limit storage failure: {message}"),
         }
     }
 }
 
-impl<R: Error + 'static> Error for LimitRejection<R> {
+impl<K: Error + 'static, Q: Error + 'static> Error for LimitRejection<K, Q> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            LimitRejection::KeyExtractionFailure(ve) => Some(ve),
+            LimitRejection::KeyExtractionFailure(error) => Some(error),
+            LimitRejection::QuotaResolutionFailure(error) => Some(error),
             LimitRejection::RateLimitExceeded(_) | LimitRejection::Backend(_) => None,
         }
     }
 }
 
-impl<R: IntoResponse> IntoResponse for LimitRejection<R> {
+impl<K: IntoResponse, Q: IntoResponse> IntoResponse for LimitRejection<K, Q> {
     fn into_response(self) -> Response {
         match self {
             LimitRejection::KeyExtractionFailure(rejection) => rejection.into_response(),
+            LimitRejection::QuotaResolutionFailure(rejection) => rejection.into_response(),
             LimitRejection::RateLimitExceeded(snapshot) => {
                 let now_ms = now_ms();
                 let mut response =
@@ -525,5 +699,243 @@ mod tests {
         assert!(left.check(uri.clone(), quota).await.expect("left").allowed);
         assert!(!left.check(uri.clone(), quota).await.expect("left").allowed);
         assert!(right.check(uri, quota).await.expect("right").allowed);
+    }
+
+    #[derive(Clone)]
+    struct ConfigState {
+        limits: LimitState<Uri>,
+        api_quota: Quota,
+    }
+
+    impl FromRef<ConfigState> for LimitState<Uri> {
+        fn from_ref(state: &ConfigState) -> Self {
+            state.limits.clone()
+        }
+    }
+
+    impl FromRef<ConfigState> for Quota {
+        fn from_ref(state: &ConfigState) -> Quota {
+            state.api_quota
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct ApiQuota(Quota);
+
+    impl FromRef<ConfigState> for ApiQuota {
+        fn from_ref(state: &ConfigState) -> Self {
+            ApiQuota(state.api_quota)
+        }
+    }
+
+    impl From<ApiQuota> for Quota {
+        fn from(value: ApiQuota) -> Self {
+            value.0
+        }
+    }
+
+    #[tokio::test]
+    async fn dynamic_limit_reads_quota_from_state() {
+        const ROUTE: &str = "/dynamic";
+        async fn handler(_: DynamicLimit<Uri, Quota>) -> impl IntoResponse {}
+
+        let state = ConfigState {
+            limits: LimitState::default(),
+            api_quota: Quota::per_second(2),
+        };
+
+        let app = Router::new().route(ROUTE, get(handler)).with_state(state);
+
+        let server = TestServer::new(app);
+
+        assert_eq!(server.get(ROUTE).await.status_code(), StatusCode::OK);
+        assert_eq!(server.get(ROUTE).await.status_code(), StatusCode::OK);
+        assert_eq!(
+            server.get(ROUTE).await.status_code(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_limit_state_quota_newtype() {
+        const ROUTE: &str = "/dynamic_newtype";
+        async fn handler(_: DynamicLimit<Uri, ApiQuota>) -> impl IntoResponse {}
+
+        let state = ConfigState {
+            limits: LimitState::default(),
+            api_quota: Quota::per_second(1),
+        };
+
+        let app = Router::new().route(ROUTE, get(handler)).with_state(state);
+
+        let server = TestServer::new(app);
+
+        assert_eq!(server.get(ROUTE).await.status_code(), StatusCode::OK);
+        assert_eq!(
+            server.get(ROUTE).await.status_code(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[tokio::test]
+    async fn different_keys_are_isolated() {
+        let state = LimitState::<Uri>::default();
+        let route_a: Uri = "/a".parse().expect("valid uri");
+        let route_b: Uri = "/b".parse().expect("valid uri");
+        let quota = Quota::per_second(1);
+
+        assert!(
+            state
+                .check(route_a.clone(), quota)
+                .await
+                .expect("a")
+                .allowed
+        );
+        assert!(!state.check(route_a, quota).await.expect("a").allowed);
+        assert!(state.check(route_b, quota).await.expect("b").allowed);
+    }
+
+    #[test]
+    fn rate_limit_headers_from_parts_reads_extension() {
+        let mut parts = http::Request::new(()).into_parts().0;
+        parts.extensions.insert(RateLimitInfo(RateLimitSnapshot {
+            allowed: true,
+            limit: 5,
+            remaining: 4,
+            reset_at_ms: 1_000,
+        }));
+
+        let headers = rate_limit_headers_from_parts(&parts).expect("headers");
+        assert_eq!(
+            headers
+                .get("x-ratelimit-limit")
+                .and_then(|value| value.to_str().ok()),
+            Some("5")
+        );
+        assert_eq!(
+            headers
+                .get("x-ratelimit-remaining")
+                .and_then(|value| value.to_str().ok()),
+            Some("4")
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_fixed_window_limit_reads_quota_from_state() {
+        #[derive(Clone)]
+        struct FixedConfigState {
+            limits: LimitState<Uri, FixedWindowPolicy>,
+            api_quota: Quota,
+        }
+
+        impl FromRef<FixedConfigState> for LimitState<Uri, FixedWindowPolicy> {
+            fn from_ref(state: &FixedConfigState) -> Self {
+                state.limits.clone()
+            }
+        }
+
+        impl FromRef<FixedConfigState> for Quota {
+            fn from_ref(state: &FixedConfigState) -> Quota {
+                state.api_quota
+            }
+        }
+
+        const ROUTE: &str = "/dynamic_fixed";
+        async fn handler(_: DynamicFixedWindowLimit<Uri, Quota>) -> impl IntoResponse {}
+
+        let state = FixedConfigState {
+            limits: LimitState::<Uri, FixedWindowPolicy>::default(),
+            api_quota: Quota::per_second(2),
+        };
+
+        let app = Router::new().route(ROUTE, get(handler)).with_state(state);
+        let server = TestServer::new(app);
+
+        assert_eq!(server.get(ROUTE).await.status_code(), StatusCode::OK);
+        assert_eq!(server.get(ROUTE).await.status_code(), StatusCode::OK);
+        assert_eq!(
+            server.get(ROUTE).await.status_code(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_sliding_window_limit_reads_quota_from_state() {
+        #[derive(Clone)]
+        struct SlidingConfigState {
+            limits: LimitState<Uri, SlidingWindowPolicy>,
+            api_quota: Quota,
+        }
+
+        impl FromRef<SlidingConfigState> for LimitState<Uri, SlidingWindowPolicy> {
+            fn from_ref(state: &SlidingConfigState) -> Self {
+                state.limits.clone()
+            }
+        }
+
+        impl FromRef<SlidingConfigState> for Quota {
+            fn from_ref(state: &SlidingConfigState) -> Quota {
+                state.api_quota
+            }
+        }
+
+        const ROUTE: &str = "/dynamic_sliding";
+        async fn handler(_: DynamicSlidingWindowLimit<Uri, Quota>) -> impl IntoResponse {}
+
+        let state = SlidingConfigState {
+            limits: LimitState::<Uri, SlidingWindowPolicy>::default(),
+            api_quota: Quota::per_second(1),
+        };
+
+        let app = Router::new().route(ROUTE, get(handler)).with_state(state);
+        let server = TestServer::new(app);
+
+        assert_eq!(server.get(ROUTE).await.status_code(), StatusCode::OK);
+        assert_eq!(
+            server.get(ROUTE).await.status_code(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[derive(Clone)]
+    struct FailingBackend;
+
+    #[async_trait::async_trait]
+    impl RateLimitBackend for FailingBackend {
+        type Error = BackendError;
+
+        fn namespace(&self) -> &str {
+            "failing"
+        }
+
+        async fn transact<P>(
+            &self,
+            _storage_key: &str,
+            _quota: Quota,
+            _now_ms: u64,
+        ) -> Result<RateLimitSnapshot, Self::Error>
+        where
+            P: RateLimitPolicy,
+        {
+            Err(BackendError::Contention)
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_failure_returns_service_unavailable() {
+        const ROUTE: &str = "/backend_fail";
+        async fn handler(_: Limit<1, 1000, Uri, FailingBackend>) -> impl IntoResponse {}
+
+        let app = Router::new()
+            .route(ROUTE, get(handler))
+            .with_state(LimitState::<Uri, TokenBucketPolicy, FailingBackend>::new(
+                FailingBackend,
+            ));
+
+        let server = TestServer::new(app);
+        assert_eq!(
+            server.get(ROUTE).await.status_code(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 }
