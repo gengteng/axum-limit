@@ -16,6 +16,17 @@ Production-oriented rate limiting for Axum with pluggable algorithms and storage
 - **Standard headers**: `X-RateLimit-*` and `Retry-After`
 - **Verified behavior**: deterministic tests + `proptest`
 
+## Requirements
+
+- **MSRV**: Rust 1.89
+
+## Cargo features
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `memory` | yes | In-memory [`MemoryBackend`] (single-node deployments) |
+| `redis` | no | [`RedisBackend`] for shared state across nodes |
+
 ## Quick start (memory backend)
 
 ```rust,no_run
@@ -27,13 +38,24 @@ async fn handler(_: LimitPerSecond<5, Uri>) -> impl IntoResponse {}
 
 #[tokio::main]
 async fn main() {
-    let app: Router<()> = Router::new()
+    let app: Router<LimitState<Uri>> = Router::new()
         .route("/api", get(handler))
         .with_state(LimitState::<Uri>::default());
 
     // axum::serve(..., app).await
 }
 ```
+
+## Built-in keys
+
+The following types implement [`Key`] and [`StorageKey`] out of the box:
+
+- [`http::Uri`]
+- [`http::Method`]
+- [`http::Version`]
+- Tuples of any types that implement both traits (e.g. `(Uri, UserId)`)
+
+Custom keys must implement both [`Key`] (extract from the request) and [`StorageKey`] (serialize for storage).
 
 ## Dynamic quota (from config)
 
@@ -62,7 +84,10 @@ impl FromRef<AppState> for Quota {
     }
 }
 
-async fn handler(_: DynamicLimit<Uri, Quota>) -> impl axum::response::IntoResponse {}
+async fn handler(limit: DynamicLimit<Uri, Quota>) -> impl axum::response::IntoResponse {
+    // Inspect the resolved quota when needed.
+    let _quota = limit.resolved_quota();
+}
 
 #[tokio::main]
 async fn main() {
@@ -83,20 +108,53 @@ For multiple quotas in one `AppState`, use a marker newtype with [`FromRef`]:
 use axum_core::extract::FromRef;
 use axum_limit::{DynamicLimit, Quota};
 
+#[derive(Clone)]
+struct AppState {
+    api_quota: Quota,
+    // ...
+}
+
 #[derive(Clone, Copy)]
 struct ApiQuota(Quota);
+
+impl FromRef<AppState> for ApiQuota {
+    fn from_ref(state: &AppState) -> Self {
+        ApiQuota(state.api_quota)
+    }
+}
 
 impl From<ApiQuota> for Quota {
     fn from(value: ApiQuota) -> Self {
         value.0
     }
 }
-// impl FromRef<AppState> for ApiQuota { ... }
 
 async fn handler(_: DynamicLimit<http::Uri, ApiQuota>) {}
 ```
 
+[`FixedQuota`] is a convenience newtype when you prefer naming the quota field explicitly in state.
+
 Changing a quota at runtime uses a new storage fingerprint, so existing counters are not carried over.
+
+## Rate limit headers on success
+
+Rejected requests include `X-RateLimit-*` and `Retry-After` automatically. For successful requests, read headers from request extensions:
+
+```rust,no_run
+use axum::{extract::Request, response::IntoResponse};
+use axum_limit::{rate_limit_headers_from_parts, LimitPerSecond};
+use http::Uri;
+
+async fn handler(
+    request: Request,
+    _: LimitPerSecond<5, Uri>,
+) -> impl IntoResponse {
+    let (parts, _body) = request.into_parts();
+    let headers = rate_limit_headers_from_parts(&parts);
+    // attach headers to your response when present
+    let _ = headers;
+}
+```
 
 ## Redis backend (multi-node)
 
@@ -134,14 +192,6 @@ use async_trait::async_trait;
 #[derive(Clone)]
 struct MyBackend;
 
-async fn load(_key: &str) -> Result<Option<Vec<u8>>, BackendError> {
-    Ok(None)
-}
-
-async fn save(_key: &str, _value: Vec<u8>) -> Result<(), BackendError> {
-    Ok(())
-}
-
 #[async_trait]
 impl RateLimitBackend for MyBackend {
     type Error = BackendError;
@@ -159,9 +209,9 @@ impl RateLimitBackend for MyBackend {
     where
         P: RateLimitPolicy,
     {
-        let payload = load(storage_key).await?;
+        let payload: Option<Vec<u8>> = None; // load from your store
         let (encoded, snapshot) = apply_policy::<P>(payload.as_deref(), quota, now_ms)?;
-        save(storage_key, encoded).await?;
+        let _ = encoded; // save to your store
         Ok(snapshot)
     }
 }
@@ -173,7 +223,8 @@ Custom keys must implement [`StorageKey`] in addition to [`Key`].
 
 - Policy state is serialized as JSON under keys like `{namespace}:{policy}:{quota}:{subject}`
 - UTC millisecond timestamps keep nodes consistent
-- Different quotas on the same subject are isolated automatically
+- Different quotas on the same subject are isolated automatically via [`Quota::fingerprint`]
+- [`Quota::burst`] controls token-bucket burst capacity (defaults to `max`)
 
 ## Algorithms
 
@@ -183,4 +234,4 @@ Custom keys must implement [`StorageKey`] in addition to [`Key`].
 | Fixed window | `FixedWindowLimit`, `DynamicFixedWindowLimit` | Lowest overhead |
 | Sliding window | `SlidingWindowLimit`, `DynamicSlidingWindowLimit` | Fair limits without window spikes |
 
-See the `examples/` directory for more.
+See the [`basic` example](examples/basic.rs) for a multi-algorithm setup with a unified `AppState`.

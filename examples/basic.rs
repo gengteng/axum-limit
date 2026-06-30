@@ -1,6 +1,11 @@
+//! Demonstrates token bucket, fixed window, and sliding window rate limiting.
+//!
+//! Run with: `cargo run --example basic`
+
 use axum::extract::Path;
 use axum::routing::get;
 use axum::Router;
+use axum_core::extract::FromRef;
 use axum_limit::{
     FixedWindowPerSecond, FixedWindowPolicy, Key, Limit, LimitPerDay, LimitPerHour, LimitPerSecond,
     LimitState, SlidingWindowPerSecond, SlidingWindowPolicy, StorageKey,
@@ -11,29 +16,71 @@ use std::hash::Hash;
 use std::net::{Ipv4Addr, SocketAddr};
 use tokio::net::TcpListener;
 
-/// Demonstrates token bucket, fixed window, and sliding window rate limiting.
+#[derive(Clone)]
+struct AppState {
+    by_method: LimitState<Method>,
+    by_uri: LimitState<Uri>,
+    by_uri_fixed: LimitState<Uri, FixedWindowPolicy>,
+    by_uri_sliding: LimitState<Uri, SlidingWindowPolicy>,
+    by_uri_id: LimitState<(Uri, Id)>,
+}
+
+impl FromRef<AppState> for LimitState<Method> {
+    fn from_ref(state: &AppState) -> Self {
+        state.by_method.clone()
+    }
+}
+
+impl FromRef<AppState> for LimitState<Uri> {
+    fn from_ref(state: &AppState) -> Self {
+        state.by_uri.clone()
+    }
+}
+
+impl FromRef<AppState> for LimitState<Uri, FixedWindowPolicy> {
+    fn from_ref(state: &AppState) -> Self {
+        state.by_uri_fixed.clone()
+    }
+}
+
+impl FromRef<AppState> for LimitState<Uri, SlidingWindowPolicy> {
+    fn from_ref(state: &AppState) -> Self {
+        state.by_uri_sliding.clone()
+    }
+}
+
+impl FromRef<AppState> for LimitState<(Uri, Id)> {
+    fn from_ref(state: &AppState) -> Self {
+        state.by_uri_id.clone()
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 8080))).await?;
+
+    let state = AppState {
+        by_method: LimitState::default(),
+        by_uri: LimitState::default(),
+        by_uri_fixed: LimitState::default(),
+        by_uri_sliding: LimitState::default(),
+        by_uri_id: LimitState::default(),
+    };
 
     let app = Router::new()
         .route(
             "/limit-2-per-500-ms-by-method",
             get(limit_2_per_500_ms_by_method),
         )
-        .with_state(LimitState::<Method>::default())
         .route("/limit-4-per-sec-by-uri", get(limit_4_per_sec_by_uri))
-        .with_state(LimitState::<Uri>::default())
         .route(
             "/fixed-window-3-per-sec-by-uri",
             get(fixed_window_3_per_sec_by_uri),
         )
-        .with_state(LimitState::<Uri, FixedWindowPolicy>::default())
         .route(
             "/sliding-window-5-per-sec-by-uri",
             get(sliding_window_5_per_sec_by_uri),
         )
-        .with_state(LimitState::<Uri, SlidingWindowPolicy>::default())
         .route(
             "/limit-100-per-hour-by-uri-id/:id/:name",
             get(limit_100_per_hour_by_id),
@@ -42,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
             "/limit-10000-per-day-by-uri-id/:id/:name",
             get(limit_10000_per_day_by_id),
         )
-        .with_state(LimitState::<(Uri, Id)>::default());
+        .with_state(state);
 
     axum::serve(listener, app).await?;
     Ok(())
