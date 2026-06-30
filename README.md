@@ -12,7 +12,7 @@ Production-oriented rate limiting for Axum with pluggable algorithms and storage
 
 - **Algorithms**: token bucket, fixed window, sliding window counter
 - **Backends**: in-memory (single node), Redis (multi-node, `redis` feature), custom via [`RateLimitBackend`]
-- **Extractor API**: declare limits in handler signatures
+- **Extractor API**: declare limits in handler signatures (static or config-backed)
 - **Standard headers**: `X-RateLimit-*` and `Retry-After`
 - **Verified behavior**: deterministic tests + `proptest`
 
@@ -34,6 +34,69 @@ async fn main() {
     // axum::serve(..., app).await
 }
 ```
+
+## Dynamic quota (from config)
+
+Keep the algorithm fixed in the handler type and load [`Quota`] from application state:
+
+```rust,no_run
+use axum_core::extract::FromRef;
+use axum_limit::{DynamicLimit, LimitState, Quota};
+use http::Uri;
+
+#[derive(Clone)]
+struct AppState {
+    limits: LimitState<Uri>,
+    api_quota: Quota, // loaded from config at startup
+}
+
+impl FromRef<AppState> for LimitState<Uri> {
+    fn from_ref(state: &AppState) -> Self {
+        state.limits.clone()
+    }
+}
+
+impl FromRef<AppState> for Quota {
+    fn from_ref(state: &AppState) -> Quota {
+        state.api_quota
+    }
+}
+
+async fn handler(_: DynamicLimit<Uri, Quota>) -> impl axum::response::IntoResponse {}
+
+#[tokio::main]
+async fn main() {
+    let state = AppState {
+        limits: LimitState::default(),
+        api_quota: Quota::per_second(100),
+    };
+
+    let _app: axum::Router<AppState> = axum::Router::new()
+        .route("/api", axum::routing::get(handler))
+        .with_state(state);
+}
+```
+
+For multiple quotas in one `AppState`, use a marker newtype with [`FromRef`]:
+
+```rust,no_run
+use axum_core::extract::FromRef;
+use axum_limit::{DynamicLimit, Quota};
+
+#[derive(Clone, Copy)]
+struct ApiQuota(Quota);
+
+impl From<ApiQuota> for Quota {
+    fn from(value: ApiQuota) -> Self {
+        value.0
+    }
+}
+// impl FromRef<AppState> for ApiQuota { ... }
+
+async fn handler(_: DynamicLimit<http::Uri, ApiQuota>) {}
+```
+
+Changing a quota at runtime uses a new storage fingerprint, so existing counters are not carried over.
 
 ## Redis backend (multi-node)
 
@@ -116,8 +179,8 @@ Custom keys must implement [`StorageKey`] in addition to [`Key`].
 
 | Algorithm | Extractor | Best for |
 |-----------|-----------|----------|
-| Token bucket | `Limit`, `LimitPerSecond` | Bursts with smooth sustained rate |
-| Fixed window | `FixedWindowLimit` | Lowest overhead |
-| Sliding window | `SlidingWindowLimit` | Fair limits without window spikes |
+| Token bucket | `Limit`, `LimitPerSecond`, `DynamicLimit` | Bursts with smooth sustained rate |
+| Fixed window | `FixedWindowLimit`, `DynamicFixedWindowLimit` | Lowest overhead |
+| Sliding window | `SlidingWindowLimit`, `DynamicSlidingWindowLimit` | Fair limits without window spikes |
 
 See the `examples/` directory for more.
