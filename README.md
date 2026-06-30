@@ -18,7 +18,7 @@ Production-oriented rate limiting for Axum with pluggable algorithms and storage
 
 ## Requirements
 
-- **MSRV**: Rust 1.88 (required by the optional `redis` 1.x dependency)
+- **MSRV**: Rust 1.89
 
 ## Cargo features
 
