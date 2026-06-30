@@ -135,4 +135,18 @@ mod tests {
             assert!(state.try_acquire(at(2000)).allowed);
         }
     }
+
+    #[test]
+    fn round_trips_through_json() {
+        let mut state = window(Quota::new(3, 1000));
+        assert!(state.try_acquire(at(0)).allowed);
+        assert!(state.try_acquire(at(100)).allowed);
+
+        let encoded = state.encode().expect("encode");
+        let mut decoded =
+            SlidingWindowState::decode(&encoded, Quota::new(3, 1000)).expect("decode");
+
+        assert!(decoded.try_acquire(at(200)).allowed);
+        assert!(!decoded.try_acquire(at(300)).allowed);
+    }
 }

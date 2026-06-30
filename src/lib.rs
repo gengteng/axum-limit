@@ -776,4 +776,166 @@ mod tests {
             StatusCode::TOO_MANY_REQUESTS
         );
     }
+
+    #[tokio::test]
+    async fn different_keys_are_isolated() {
+        let state = LimitState::<Uri>::default();
+        let route_a: Uri = "/a".parse().expect("valid uri");
+        let route_b: Uri = "/b".parse().expect("valid uri");
+        let quota = Quota::per_second(1);
+
+        assert!(
+            state
+                .check(route_a.clone(), quota)
+                .await
+                .expect("a")
+                .allowed
+        );
+        assert!(!state.check(route_a, quota).await.expect("a").allowed);
+        assert!(state.check(route_b, quota).await.expect("b").allowed);
+    }
+
+    #[test]
+    fn rate_limit_headers_from_parts_reads_extension() {
+        let mut parts = http::Request::new(()).into_parts().0;
+        parts.extensions.insert(RateLimitInfo(RateLimitSnapshot {
+            allowed: true,
+            limit: 5,
+            remaining: 4,
+            reset_at_ms: 1_000,
+        }));
+
+        let headers = rate_limit_headers_from_parts(&parts).expect("headers");
+        assert_eq!(
+            headers
+                .get("x-ratelimit-limit")
+                .and_then(|value| value.to_str().ok()),
+            Some("5")
+        );
+        assert_eq!(
+            headers
+                .get("x-ratelimit-remaining")
+                .and_then(|value| value.to_str().ok()),
+            Some("4")
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_fixed_window_limit_reads_quota_from_state() {
+        #[derive(Clone)]
+        struct FixedConfigState {
+            limits: LimitState<Uri, FixedWindowPolicy>,
+            api_quota: Quota,
+        }
+
+        impl FromRef<FixedConfigState> for LimitState<Uri, FixedWindowPolicy> {
+            fn from_ref(state: &FixedConfigState) -> Self {
+                state.limits.clone()
+            }
+        }
+
+        impl FromRef<FixedConfigState> for Quota {
+            fn from_ref(state: &FixedConfigState) -> Quota {
+                state.api_quota
+            }
+        }
+
+        const ROUTE: &str = "/dynamic_fixed";
+        async fn handler(_: DynamicFixedWindowLimit<Uri, Quota>) -> impl IntoResponse {}
+
+        let state = FixedConfigState {
+            limits: LimitState::<Uri, FixedWindowPolicy>::default(),
+            api_quota: Quota::per_second(2),
+        };
+
+        let app = Router::new().route(ROUTE, get(handler)).with_state(state);
+        let server = TestServer::new(app);
+
+        assert_eq!(server.get(ROUTE).await.status_code(), StatusCode::OK);
+        assert_eq!(server.get(ROUTE).await.status_code(), StatusCode::OK);
+        assert_eq!(
+            server.get(ROUTE).await.status_code(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_sliding_window_limit_reads_quota_from_state() {
+        #[derive(Clone)]
+        struct SlidingConfigState {
+            limits: LimitState<Uri, SlidingWindowPolicy>,
+            api_quota: Quota,
+        }
+
+        impl FromRef<SlidingConfigState> for LimitState<Uri, SlidingWindowPolicy> {
+            fn from_ref(state: &SlidingConfigState) -> Self {
+                state.limits.clone()
+            }
+        }
+
+        impl FromRef<SlidingConfigState> for Quota {
+            fn from_ref(state: &SlidingConfigState) -> Quota {
+                state.api_quota
+            }
+        }
+
+        const ROUTE: &str = "/dynamic_sliding";
+        async fn handler(_: DynamicSlidingWindowLimit<Uri, Quota>) -> impl IntoResponse {}
+
+        let state = SlidingConfigState {
+            limits: LimitState::<Uri, SlidingWindowPolicy>::default(),
+            api_quota: Quota::per_second(1),
+        };
+
+        let app = Router::new().route(ROUTE, get(handler)).with_state(state);
+        let server = TestServer::new(app);
+
+        assert_eq!(server.get(ROUTE).await.status_code(), StatusCode::OK);
+        assert_eq!(
+            server.get(ROUTE).await.status_code(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[derive(Clone)]
+    struct FailingBackend;
+
+    #[async_trait::async_trait]
+    impl RateLimitBackend for FailingBackend {
+        type Error = BackendError;
+
+        fn namespace(&self) -> &str {
+            "failing"
+        }
+
+        async fn transact<P>(
+            &self,
+            _storage_key: &str,
+            _quota: Quota,
+            _now_ms: u64,
+        ) -> Result<RateLimitSnapshot, Self::Error>
+        where
+            P: RateLimitPolicy,
+        {
+            Err(BackendError::Contention)
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_failure_returns_service_unavailable() {
+        const ROUTE: &str = "/backend_fail";
+        async fn handler(_: Limit<1, 1000, Uri, FailingBackend>) -> impl IntoResponse {}
+
+        let app = Router::new()
+            .route(ROUTE, get(handler))
+            .with_state(LimitState::<Uri, TokenBucketPolicy, FailingBackend>::new(
+                FailingBackend,
+            ));
+
+        let server = TestServer::new(app);
+        assert_eq!(
+            server.get(ROUTE).await.status_code(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
 }

@@ -122,3 +122,25 @@ where
     let snapshot = state.try_acquire(now_ms);
     Ok((state.encode()?, snapshot))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::{FixedWindowPolicy, TokenBucketPolicy};
+    use crate::quota::Quota;
+
+    #[test]
+    fn build_storage_key_includes_policy_quota_and_subject() {
+        let quota = Quota::with_burst(5, 1000, 10);
+        let key = build_storage_key::<TokenBucketPolicy>("ns", "user-1", quota);
+        assert_eq!(key, "ns:token_bucket:5:1000:10:user-1");
+    }
+
+    #[test]
+    fn different_quotas_produce_different_storage_keys() {
+        let subject = "shared";
+        let key_a = build_storage_key::<FixedWindowPolicy>("ns", subject, Quota::new(1, 1000));
+        let key_b = build_storage_key::<FixedWindowPolicy>("ns", subject, Quota::new(5, 1000));
+        assert_ne!(key_a, key_b);
+    }
+}
