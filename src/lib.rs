@@ -2,183 +2,200 @@
 #![deny(unsafe_code, missing_docs, clippy::unwrap_used)]
 
 mod key;
+mod policy;
+mod quota;
 
 use axum_core::extract::{FromRef, FromRequestParts};
 use axum_core::response::{IntoResponse, Response};
 use dashmap::DashMap;
 use http::request::Parts;
 use http::StatusCode;
+use policy::{RateLimitPolicy, RateLimitState};
 use std::error::Error;
 use std::fmt::Display;
 use std::hash::Hash;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-/// Represents a rate limit configuration with generic parameters for count and time period.
-/// This struct uses generics to allow flexible integration with any extractor that implements the `Key` trait.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Limit<const COUNT: usize, const PER: u64, K>(pub K::Extractor)
-where
-    K: Key;
+pub use policy::{FixedWindowPolicy, TokenBucketPolicy};
+pub use quota::Quota;
 
-/// Rate limit configured to apply per second.
+macro_rules! define_limit_extractor {
+    (
+        $(#[$struct_meta:meta])*
+        $name:ident => $policy:ty
+    ) => {
+        $(#[$struct_meta])*
+        #[derive(Debug, Clone, Copy, Default)]
+        pub struct $name<const COUNT: usize, const PER: u64, K>(pub K::Extractor)
+        where
+            K: Key;
+
+        impl<const COUNT: usize, const PER: u64, K> AsRef<K::Extractor> for $name<COUNT, PER, K>
+        where
+            K: Key,
+        {
+            fn as_ref(&self) -> &K::Extractor {
+                &self.0
+            }
+        }
+
+        impl<const COUNT: usize, const PER: u64, K> AsMut<K::Extractor> for $name<COUNT, PER, K>
+        where
+            K: Key,
+        {
+            fn as_mut(&mut self) -> &mut K::Extractor {
+                &mut self.0
+            }
+        }
+
+        impl<const COUNT: usize, const PER: u64, K> Deref for $name<COUNT, PER, K>
+        where
+            K: Key,
+        {
+            type Target = K::Extractor;
+
+            fn deref(&self) -> &Self::Target {
+                &self.0
+            }
+        }
+
+        impl<const COUNT: usize, const PER: u64, K> DerefMut for $name<COUNT, PER, K>
+        where
+            K: Key,
+        {
+            fn deref_mut(&mut self) -> &mut Self::Target {
+                &mut self.0
+            }
+        }
+
+        impl<const COUNT: usize, const PER: u64, K> Display for $name<COUNT, PER, K>
+        where
+            K: Key,
+            K::Extractor: Display,
+        {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt(f)
+            }
+        }
+
+        impl<const COUNT: usize, const PER: u64, K> $name<COUNT, PER, K>
+        where
+            K: Key,
+        {
+            /// Returns the count of requests allowed within the specified period.
+            pub const fn count() -> usize {
+                COUNT
+            }
+
+            /// Returns the period (in milliseconds) for which the limit applies.
+            pub const fn per() -> u64 {
+                PER
+            }
+
+            /// Returns the quota configured by this extractor.
+            pub const fn quota() -> Quota {
+                Quota::new(COUNT, PER)
+            }
+
+            /// Consumes the limit and returns the inner extractor.
+            pub fn into_inner(self) -> K::Extractor {
+                self.0
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl<const C: usize, const P: u64, K, S> FromRequestParts<S> for $name<C, P, K>
+        where
+            LimitState<K, $policy>: FromRef<S>,
+            S: Send + Sync,
+            K: Key,
+            K::Extractor: FromRequestParts<S>,
+        {
+            type Rejection =
+                LimitRejection<<<K as Key>::Extractor as FromRequestParts<S>>::Rejection>;
+
+            async fn from_request_parts(
+                parts: &mut Parts,
+                state: &S,
+            ) -> Result<Self, Self::Rejection> {
+                let key_extractor = match K::Extractor::from_request_parts(parts, state).await {
+                    Ok(ke) => ke,
+                    Err(rejection) => return Err(LimitRejection::KeyExtractionFailure(rejection)),
+                };
+
+                let limit_state: LimitState<K, $policy> = FromRef::from_ref(state);
+                let key = K::from_extractor(&key_extractor);
+                if limit_state.check(key, Quota::new(C, P)) {
+                    Ok(Self(key_extractor))
+                } else {
+                    Err(LimitRejection::RateLimitExceeded)
+                }
+            }
+        }
+    };
+}
+
+define_limit_extractor! {
+    /// Token-bucket rate limit extractor.
+    Limit => TokenBucketPolicy
+}
+
+define_limit_extractor! {
+    /// Fixed-window rate limit extractor.
+    FixedWindowLimit => FixedWindowPolicy
+}
+
+/// Token-bucket rate limit configured to apply per second.
 pub type LimitPerSecond<const COUNT: usize, K> = Limit<COUNT, 1000, K>;
 
-/// Rate limit configured to apply per minute.
+/// Token-bucket rate limit configured to apply per minute.
 pub type LimitPerMinute<const COUNT: usize, K> = Limit<COUNT, 60_000, K>;
 
-/// Rate limit configured to apply per hour.
+/// Token-bucket rate limit configured to apply per hour.
 pub type LimitPerHour<const COUNT: usize, K> = Limit<COUNT, 3_600_000, K>;
 
-/// Rate limit configured to apply per day.
+/// Token-bucket rate limit configured to apply per day.
 pub type LimitPerDay<const COUNT: usize, K> = Limit<COUNT, 86_400_000, K>;
 
-impl<const COUNT: usize, const PER: u64, K> AsRef<K::Extractor> for Limit<COUNT, PER, K>
-where
-    K: Key,
-{
-    fn as_ref(&self) -> &K::Extractor {
-        &self.0
-    }
-}
+/// Fixed-window rate limit configured to apply per second.
+pub type FixedWindowPerSecond<const COUNT: usize, K> = FixedWindowLimit<COUNT, 1000, K>;
 
-impl<const COUNT: usize, const PER: u64, K> AsMut<K::Extractor> for Limit<COUNT, PER, K>
-where
-    K: Key,
-{
-    fn as_mut(&mut self) -> &mut K::Extractor {
-        &mut self.0
-    }
-}
+/// Fixed-window rate limit configured to apply per minute.
+pub type FixedWindowPerMinute<const COUNT: usize, K> = FixedWindowLimit<COUNT, 60_000, K>;
 
-impl<const COUNT: usize, const PER: u64, K> Deref for Limit<COUNT, PER, K>
-where
-    K: Key,
-{
-    type Target = K::Extractor;
+/// Fixed-window rate limit configured to apply per hour.
+pub type FixedWindowPerHour<const COUNT: usize, K> = FixedWindowLimit<COUNT, 3_600_000, K>;
 
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<const COUNT: usize, const PER: u64, K> DerefMut for Limit<COUNT, PER, K>
-where
-    K: Key,
-{
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl<const COUNT: usize, const PER: u64, K> Display for Limit<COUNT, PER, K>
-where
-    K: Key,
-    K::Extractor: Display,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl<const COUNT: usize, const PER: u64, K> Limit<COUNT, PER, K>
-where
-    K: Key,
-{
-    /// Returns the count of requests allowed within the specified period.
-    pub const fn count() -> usize {
-        COUNT
-    }
-
-    /// Returns the period (in milliseconds) for which the limit applies.
-    pub const fn per() -> u64 {
-        PER
-    }
-
-    /// Consumes the limit and returns the inner extractor, allowing direct access to the underlying mechanism.
-    pub fn into_inner(self) -> K::Extractor {
-        self.0
-    }
-}
+/// Fixed-window rate limit configured to apply per day.
+pub type FixedWindowPerDay<const COUNT: usize, K> = FixedWindowLimit<COUNT, 86_400_000, K>;
 
 /// Trait defining the requirements for a key extractor, which is used to uniquely identify limit subjects
 /// and extract rate limit parameters dynamically in request processing.
 #[async_trait::async_trait]
 pub trait Key: Eq + Hash + Send + Sync {
-    /// The `Extractor` associated type represents a component capable of extracting key-specific information from request parts.
-    /// This information is then used to manage and enforce rate limits dynamically within the application.
+    /// Extractor used to build a rate limit key from request parts.
     type Extractor;
-    /// Creates an instance of `Self` from the provided extractor reference, allowing extraction of key data.
+    /// Creates an instance of `Self` from the provided extractor reference.
     fn from_extractor(extractor: &Self::Extractor) -> Self;
 }
 
-/// Implements a token bucket for rate limiting.
-/// This struct manages the tokens for rate limiting, providing methods to acquire and refill tokens based on time elapsed.
-struct TokenBucket {
-    tokens: usize,
-    last_refill_time: Instant,
-    refill_duration: Duration,
-}
-
-impl TokenBucket {
-    /// Constructs a new `TokenBucket` with a specific number of tokens and a refill period.
-    fn new(tokens: impl Into<usize>, per: impl Into<u64>) -> Self {
-        Self {
-            tokens: tokens.into(),
-            last_refill_time: Instant::now(),
-            refill_duration: Duration::from_millis(per.into()),
-        }
-    }
-
-    /// Attempts to acquire a token. Returns `true` if a token was successfully acquired.
-    fn try_acquire(&mut self) -> bool {
-        self.refill();
-        if self.tokens > 0 {
-            self.tokens -= 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Refills tokens based on time elapsed since the last refill.
-    fn refill(&mut self) {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_refill_time);
-
-        // Calculate the elapsed time in milliseconds
-        if elapsed >= self.refill_duration {
-            let elapsed_millis = elapsed.as_millis() as u64; // Convert elapsed time to milliseconds
-            let refill_duration_millis = self.refill_duration.as_millis() as u64; // Convert refill duration to milliseconds
-
-            // Calculate the number of new tokens to add
-            let new_tokens = (elapsed_millis / refill_duration_millis) as usize;
-            self.tokens += new_tokens;
-
-            // Reset the last refill time to avoid under-refilling tokens
-            self.last_refill_time =
-                now - Duration::from_millis(elapsed_millis % refill_duration_millis);
-        }
-    }
-}
-
-/// Manages the state of rate limits for various keys.
-/// This struct holds a concurrent map of keys to their corresponding `TokenBucket` instances,
-/// enabling efficient state management across asynchronous tasks.
+/// Manages per-key state for a specific [`RateLimitPolicy`].
 #[derive(Clone)]
-pub struct LimitState<K>
+pub struct LimitState<K, P = TokenBucketPolicy>
 where
     K: Key,
+    P: RateLimitPolicy,
 {
-    rate_limits: Arc<DashMap<K, TokenBucket>>,
+    rate_limits: Arc<DashMap<K, P::State>>,
 }
 
-impl<K> Default for LimitState<K>
+impl<K, P> Default for LimitState<K, P>
 where
     K: Key,
+    P: RateLimitPolicy,
 {
-    /// Constructs a new `LimitState` with an empty map of rate limits.
     fn default() -> Self {
         Self {
             rate_limits: Arc::new(DashMap::new()),
@@ -186,43 +203,18 @@ where
     }
 }
 
-impl<K> LimitState<K>
+impl<K, P> LimitState<K, P>
 where
     K: Key,
+    P: RateLimitPolicy,
 {
     /// Checks and updates the rate limit for the given key, returning `true` if the request can proceed.
-    pub fn check(&self, key: K, count: usize, per: u64) -> bool {
-        let mut bucket = self
+    pub fn check(&self, key: K, quota: Quota) -> bool {
+        let mut state = self
             .rate_limits
             .entry(key)
-            .or_insert_with(|| TokenBucket::new(count, per));
-        bucket.try_acquire()
-    }
-}
-
-#[async_trait::async_trait]
-impl<const C: usize, const P: u64, K, S> FromRequestParts<S> for Limit<C, P, K>
-where
-    LimitState<K>: FromRef<S>,
-    S: Send + Sync,
-    K: Key,
-    K::Extractor: FromRequestParts<S>,
-{
-    type Rejection = LimitRejection<<<K as Key>::Extractor as FromRequestParts<S>>::Rejection>;
-
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let key_extractor = match K::Extractor::from_request_parts(parts, state).await {
-            Ok(ke) => ke,
-            Err(rejection) => return Err(LimitRejection::KeyExtractionFailure(rejection)),
-        };
-
-        let limit_state: LimitState<K> = FromRef::from_ref(state);
-        let key = K::from_extractor(&key_extractor);
-        if limit_state.check(key, C, P) {
-            Ok(Self(key_extractor))
-        } else {
-            Err(LimitRejection::RateLimitExceeded)
-        }
+            .or_insert_with(|| P::create_state(quota));
+        state.try_acquire(Instant::now())
     }
 }
 
@@ -273,9 +265,10 @@ mod tests {
     use axum_test::TestServer;
     use http::Uri;
     use std::future::IntoFuture;
+    use std::time::Duration;
 
     #[tokio::test]
-    async fn limit() {
+    async fn token_bucket_limit() {
         const TEST_ROUTE0: &str = "/limit0";
         const TEST_ROUTE1: &str = "/limit1";
         async fn handler0(Limit(_uri): Limit<1, 1, Uri>) -> impl IntoResponse {}
@@ -315,7 +308,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn limit_per_100_millis() {
+    async fn token_bucket_limit_per_100_millis() {
         const TEST_ROUTE: &str = "/limit_per_100_millis";
 
         async fn handler(Limit(_uri): Limit<1, 100, Uri>) -> impl IntoResponse {}
@@ -326,19 +319,74 @@ mod tests {
 
         let server = TestServer::new(my_app).expect("Failed to create test server");
 
-        // 第一次请求应该成功
         let response = server.get(TEST_ROUTE).await;
         assert_eq!(response.status_code(), StatusCode::OK);
 
-        // 马上再发起一次请求应该被限制
         let response = server.get(TEST_ROUTE).await;
         assert_eq!(response.status_code(), StatusCode::TOO_MANY_REQUESTS);
 
-        // 等待 100 毫秒
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // 再次请求应该成功
         let response = server.get(TEST_ROUTE).await;
         assert_eq!(response.status_code(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_bucket_limit_per_second_allows_count_per_second() {
+        const ROUTE: &str = "/per_sec";
+        async fn handler(_: LimitPerSecond<5, Uri>) -> impl IntoResponse {}
+
+        let app = Router::new()
+            .route(ROUTE, get(handler))
+            .with_state(LimitState::default());
+
+        let server = TestServer::new(app).expect("server");
+
+        for _ in 0..5 {
+            assert_eq!(server.get(ROUTE).await.status_code(), StatusCode::OK);
+        }
+        assert_eq!(
+            server.get(ROUTE).await.status_code(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        for _ in 0..5 {
+            assert_eq!(server.get(ROUTE).await.status_code(), StatusCode::OK);
+        }
+        assert_eq!(
+            server.get(ROUTE).await.status_code(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[tokio::test]
+    async fn fixed_window_limit_per_second() {
+        const ROUTE: &str = "/fixed_per_sec";
+        async fn handler(_: FixedWindowPerSecond<3, Uri>) -> impl IntoResponse {}
+
+        let app = Router::new()
+            .route(ROUTE, get(handler))
+            .with_state(LimitState::<Uri, FixedWindowPolicy>::default());
+
+        let server = TestServer::new(app).expect("server");
+
+        for _ in 0..3 {
+            assert_eq!(server.get(ROUTE).await.status_code(), StatusCode::OK);
+        }
+        assert_eq!(
+            server.get(ROUTE).await.status_code(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        for _ in 0..3 {
+            assert_eq!(server.get(ROUTE).await.status_code(), StatusCode::OK);
+        }
+        assert_eq!(
+            server.get(ROUTE).await.status_code(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
     }
 }
