@@ -125,7 +125,6 @@ macro_rules! define_limit_extractor {
             }
         }
 
-        #[async_trait::async_trait]
         impl<const C: usize, const P: u64, K, B, S> FromRequestParts<S> for $name<C, P, K, B>
         where
             B: RateLimitBackend,
@@ -138,27 +137,31 @@ macro_rules! define_limit_extractor {
             type Rejection =
                 LimitRejection<<<K as Key>::Extractor as FromRequestParts<S>>::Rejection>;
 
-            async fn from_request_parts(
+            fn from_request_parts(
                 parts: &mut Parts,
                 state: &S,
-            ) -> Result<Self, Self::Rejection> {
-                let key_extractor = match K::Extractor::from_request_parts(parts, state).await {
-                    Ok(ke) => ke,
-                    Err(rejection) => return Err(LimitRejection::KeyExtractionFailure(rejection)),
-                };
+            ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
+                async move {
+                    let key_extractor = match K::Extractor::from_request_parts(parts, state).await {
+                        Ok(ke) => ke,
+                        Err(rejection) => {
+                            return Err(LimitRejection::KeyExtractionFailure(rejection));
+                        }
+                    };
 
-                let limit_state: LimitState<K, $policy, B> = FromRef::from_ref(state);
-                let key = K::from_extractor(&key_extractor);
-                let snapshot = limit_state
-                    .check(key, Quota::new(C, P))
-                    .await
-                    .map_err(|error| LimitRejection::Backend(error.to_string()))?;
+                    let limit_state: LimitState<K, $policy, B> = FromRef::from_ref(state);
+                    let key = K::from_extractor(&key_extractor);
+                    let snapshot = limit_state
+                        .check(key, Quota::new(C, P))
+                        .await
+                        .map_err(|error| LimitRejection::Backend(error.to_string()))?;
 
-                if snapshot.allowed {
-                    parts.extensions.insert(RateLimitInfo(snapshot));
-                    Ok(Self(key_extractor, std::marker::PhantomData))
-                } else {
-                    Err(LimitRejection::RateLimitExceeded(snapshot))
+                    if snapshot.allowed {
+                        parts.extensions.insert(RateLimitInfo(snapshot));
+                        Ok(Self(key_extractor, std::marker::PhantomData))
+                    } else {
+                        Err(LimitRejection::RateLimitExceeded(snapshot))
+                    }
                 }
             }
         }
@@ -366,7 +369,7 @@ mod tests {
             .route(TEST_ROUTE1, get(handler1))
             .with_state(LimitState::default());
 
-        let server = TestServer::new(my_app).expect("Failed to create test server");
+        let server = TestServer::new(my_app);
 
         let response = server.get(TEST_ROUTE0).await;
         assert_eq!(response.status_code(), StatusCode::OK);
@@ -402,7 +405,7 @@ mod tests {
             .route(ROUTE, get(handler))
             .with_state(LimitState::default());
 
-        let server = TestServer::new(app).expect("server");
+        let server = TestServer::new(app);
 
         for _ in 0..5 {
             assert_eq!(server.get(ROUTE).await.status_code(), StatusCode::OK);
@@ -427,7 +430,7 @@ mod tests {
             .route(ROUTE, get(handler))
             .with_state(LimitState::<Uri, FixedWindowPolicy>::default());
 
-        let server = TestServer::new(app).expect("server");
+        let server = TestServer::new(app);
 
         for _ in 0..3 {
             assert_eq!(server.get(ROUTE).await.status_code(), StatusCode::OK);
@@ -453,7 +456,7 @@ mod tests {
             .route(ROUTE, get(handler))
             .with_state(LimitState::<Uri, SlidingWindowPolicy>::default());
 
-        let server = TestServer::new(app).expect("server");
+        let server = TestServer::new(app);
 
         for _ in 0..3 {
             assert_eq!(server.get(ROUTE).await.status_code(), StatusCode::OK);
@@ -479,7 +482,7 @@ mod tests {
             .route(ROUTE, get(handler))
             .with_state(LimitState::default());
 
-        let server = TestServer::new(app).expect("server");
+        let server = TestServer::new(app);
 
         assert_eq!(server.get(ROUTE).await.status_code(), StatusCode::OK);
         let response = server.get(ROUTE).await;

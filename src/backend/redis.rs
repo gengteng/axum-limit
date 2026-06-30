@@ -3,7 +3,7 @@ use crate::policy::RateLimitPolicy;
 use crate::quota::Quota;
 use crate::snapshot::RateLimitSnapshot;
 use async_trait::async_trait;
-use redis::AsyncCommands;
+use redis::{AsyncCommands, ServerErrorKind};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -99,7 +99,7 @@ impl RateLimitBackend for RedisBackend {
                 Ok(Some(())) => return Ok(snapshot),
                 Ok(None) => continue,
                 Err(error) => {
-                    if error.kind() == redis::ErrorKind::ExecAbortError {
+                    if error.kind() == redis::ErrorKind::Server(ServerErrorKind::ExecAbort) {
                         tokio::time::sleep(Duration::from_millis(1)).await;
                         continue;
                     }
