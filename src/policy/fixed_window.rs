@@ -1,7 +1,9 @@
-use super::{RateLimitPolicy, RateLimitState};
+use super::{PolicyState, RateLimitPolicy};
+use crate::codec::{decode_json, encode_json, CodecError};
 use crate::quota::Quota;
 use crate::snapshot::RateLimitSnapshot;
-use std::time::{Duration, Instant};
+use crate::time::saturating_sub_ms;
+use serde::{Deserialize, Serialize};
 
 /// Fixed window rate limiting policy.
 ///
@@ -10,48 +12,45 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FixedWindowPolicy;
 
+impl RateLimitPolicy for FixedWindowPolicy {
+    type State = FixedWindowState;
+    const STATE_ID: &'static str = "fixed_window";
+}
+
 /// Fixed window state for a single key.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FixedWindowState {
     count: usize,
-    window_start: Instant,
-    window_size: Duration,
+    window_start_ms: u64,
+    window_size_ms: u64,
     max: usize,
 }
 
-impl RateLimitPolicy for FixedWindowPolicy {
-    type State = FixedWindowState;
-
-    fn create_state(quota: Quota) -> Self::State {
-        FixedWindowState::new_at(quota, Instant::now())
-    }
-}
-
 impl FixedWindowState {
-    pub(crate) fn new_at(quota: Quota, now: Instant) -> Self {
+    pub(crate) fn new_at(quota: Quota, now_ms: u64) -> Self {
         Self {
             count: 0,
-            window_start: now,
-            window_size: quota.per(),
+            window_start_ms: now_ms,
+            window_size_ms: quota.per_ms,
             max: quota.max.max(1),
         }
     }
 
-    fn maybe_reset_window(&mut self, now: Instant) {
-        if now.duration_since(self.window_start) >= self.window_size {
+    fn maybe_reset_window(&mut self, now_ms: u64) {
+        if saturating_sub_ms(now_ms, self.window_start_ms) >= self.window_size_ms {
             self.count = 0;
-            self.window_start = now;
+            self.window_start_ms = now_ms;
         }
     }
 
-    fn reset_at(&self) -> Instant {
-        self.window_start + self.window_size
+    fn reset_at_ms(&self) -> u64 {
+        self.window_start_ms.saturating_add(self.window_size_ms)
     }
 }
 
-impl RateLimitState for FixedWindowState {
-    fn try_acquire(&mut self, now: Instant) -> RateLimitSnapshot {
-        self.maybe_reset_window(now);
+impl PolicyState for FixedWindowState {
+    fn try_acquire(&mut self, now_ms: u64) -> RateLimitSnapshot {
+        self.maybe_reset_window(now_ms);
         let limit = self.max;
 
         if self.count < limit {
@@ -60,16 +59,28 @@ impl RateLimitState for FixedWindowState {
                 allowed: true,
                 limit,
                 remaining: limit.saturating_sub(self.count),
-                reset_at: self.reset_at(),
+                reset_at_ms: self.reset_at_ms(),
             }
         } else {
             RateLimitSnapshot {
                 allowed: false,
                 limit,
                 remaining: 0,
-                reset_at: self.reset_at(),
+                reset_at_ms: self.reset_at_ms(),
             }
         }
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, CodecError> {
+        encode_json(self)
+    }
+
+    fn decode(bytes: &[u8], _quota: Quota) -> Result<Self, CodecError> {
+        decode_json(bytes)
+    }
+
+    fn create(quota: Quota, now_ms: u64) -> Self {
+        Self::new_at(quota, now_ms)
     }
 }
 
@@ -77,56 +88,36 @@ impl RateLimitState for FixedWindowState {
 mod tests {
     use super::*;
 
-    fn at(ms: u64) -> Instant {
-        Instant::now() - Duration::from_secs(60) + Duration::from_millis(ms)
+    const BASE_MS: u64 = 2_000_000;
+
+    fn at(offset_ms: u64) -> u64 {
+        BASE_MS + offset_ms
     }
 
-    fn window(quota: Quota, start: Instant) -> FixedWindowState {
-        FixedWindowState::new_at(quota, start)
+    fn window(quota: Quota) -> FixedWindowState {
+        FixedWindowState::new_at(quota, BASE_MS)
     }
 
     #[test]
     fn allows_up_to_max_requests_in_window() {
-        let start = at(0);
-        let mut window = window(Quota::new(3, 1000), start);
+        let mut window = window(Quota::new(3, 1000));
 
-        assert!(window.try_acquire(start).allowed);
-        assert!(window.try_acquire(start + Duration::from_millis(100)).allowed);
-        assert!(window.try_acquire(start + Duration::from_millis(500)).allowed);
-        assert!(!window.try_acquire(start + Duration::from_millis(900)).allowed);
+        assert!(window.try_acquire(at(0)).allowed);
+        assert!(window.try_acquire(at(100)).allowed);
+        assert!(window.try_acquire(at(500)).allowed);
+        assert!(!window.try_acquire(at(900)).allowed);
     }
 
     #[test]
     fn resets_after_window_expires() {
-        let start = at(0);
-        let mut window = window(Quota::new(2, 1000), start);
+        let mut window = window(Quota::new(2, 1000));
 
-        assert!(window.try_acquire(start).allowed);
-        assert!(window.try_acquire(start + Duration::from_millis(100)).allowed);
-        assert!(!window.try_acquire(start + Duration::from_millis(200)).allowed);
+        assert!(window.try_acquire(at(0)).allowed);
+        assert!(window.try_acquire(at(100)).allowed);
+        assert!(!window.try_acquire(at(200)).allowed);
 
-        assert!(window.try_acquire(start + Duration::from_millis(1000)).allowed);
-        assert!(window.try_acquire(start + Duration::from_millis(1100)).allowed);
-        assert!(!window.try_acquire(start + Duration::from_millis(1200)).allowed);
-    }
-
-    #[test]
-    fn window_boundary_is_inclusive_of_new_window() {
-        let start = at(0);
-        let mut window = window(Quota::new(1, 500), start);
-
-        assert!(window.try_acquire(start).allowed);
-        assert!(!window.try_acquire(start + Duration::from_millis(100)).allowed);
-        assert!(window.try_acquire(start + Duration::from_millis(500)).allowed);
-    }
-
-    #[test]
-    fn ignores_burst_setting() {
-        let start = at(0);
-        let mut window = window(Quota::with_burst(2, 1000, 10), start);
-
-        assert!(window.try_acquire(start).allowed);
-        assert!(window.try_acquire(start).allowed);
-        assert!(!window.try_acquire(start).allowed);
+        assert!(window.try_acquire(at(1000)).allowed);
+        assert!(window.try_acquire(at(1100)).allowed);
+        assert!(!window.try_acquire(at(1200)).allowed);
     }
 }

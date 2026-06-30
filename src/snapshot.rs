@@ -1,6 +1,6 @@
+use crate::time::{millis_to_secs, saturating_sub_ms};
 use http::header::{HeaderName, HeaderValue, RETRY_AFTER};
 use http::HeaderMap;
-use std::time::{Duration, Instant};
 
 /// Result of a rate limit check, including metadata for standard response headers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,23 +11,23 @@ pub struct RateLimitSnapshot {
     pub limit: usize,
     /// Remaining requests in the current window or bucket.
     pub remaining: usize,
-    /// When the limit fully resets or the next token becomes available.
-    pub reset_at: Instant,
+    /// UTC timestamp in milliseconds when the limit fully resets.
+    pub reset_at_ms: u64,
 }
 
 impl RateLimitSnapshot {
-    /// Returns how long to wait before retrying from `now`.
-    pub fn retry_after(&self, now: Instant) -> Duration {
-        self.reset_at.saturating_duration_since(now)
+    /// Returns how long to wait before retrying from `now_ms`.
+    pub fn retry_after_ms(&self, now_ms: u64) -> u64 {
+        saturating_sub_ms(self.reset_at_ms, now_ms)
     }
 
     /// Returns `Retry-After` in whole seconds, at least 1 when limited.
-    pub fn retry_after_secs(&self, now: Instant) -> u64 {
-        self.retry_after(now).as_secs().max(1)
+    pub fn retry_after_secs(&self, now_ms: u64) -> u64 {
+        self.retry_after_ms(now_ms).div_ceil(1000).max(1)
     }
 
     /// Builds standard rate limit headers from this snapshot.
-    pub fn to_headers(&self, now: Instant) -> HeaderMap {
+    pub fn to_headers(&self, now_ms: u64) -> HeaderMap {
         let mut headers = HeaderMap::new();
         insert_header(
             &mut headers,
@@ -42,14 +42,14 @@ impl RateLimitSnapshot {
         insert_header(
             &mut headers,
             HeaderName::from_static("x-ratelimit-reset"),
-            unix_timestamp_secs(self.reset_at),
+            millis_to_secs(self.reset_at_ms),
         );
 
         if !self.allowed {
             insert_header(
                 &mut headers,
                 RETRY_AFTER,
-                self.retry_after_secs(now),
+                self.retry_after_secs(now_ms),
             );
         }
 
@@ -67,28 +67,23 @@ fn insert_header(headers: &mut HeaderMap, name: HeaderName, value: impl ToString
     }
 }
 
-fn unix_timestamp_secs(instant: Instant) -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-        .saturating_add(instant.saturating_duration_since(Instant::now()).as_secs())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use crate::time::now_ms;
+
     #[test]
     fn headers_include_limit_metadata() {
-        let now = Instant::now();
+        let now_ms = now_ms();
         let snapshot = RateLimitSnapshot {
             allowed: false,
             limit: 10,
             remaining: 0,
-            reset_at: now + Duration::from_secs(30),
+            reset_at_ms: now_ms + 30_000,
         };
 
-        let headers = snapshot.to_headers(now);
+        let headers = snapshot.to_headers(now_ms);
         assert_eq!(
             headers
                 .get("x-ratelimit-limit")

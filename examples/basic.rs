@@ -3,7 +3,7 @@ use axum::routing::get;
 use axum::Router;
 use axum_limit::{
     FixedWindowPerSecond, FixedWindowPolicy, Key, Limit, LimitPerDay, LimitPerHour,
-    LimitPerSecond, LimitState, SlidingWindowPerSecond, SlidingWindowPolicy,
+    LimitPerSecond, LimitState, SlidingWindowPerSecond, SlidingWindowPolicy, StorageKey,
 };
 use http::{Method, Uri};
 use serde::Deserialize;
@@ -52,21 +52,13 @@ async fn limit_2_per_500_ms_by_method(_: Limit<2, 500, Method>) {}
 async fn limit_4_per_sec_by_uri(_: LimitPerSecond<4, Uri>) {}
 async fn fixed_window_3_per_sec_by_uri(_: FixedWindowPerSecond<3, Uri>) {}
 async fn sliding_window_5_per_sec_by_uri(_: SlidingWindowPerSecond<5, Uri>) {}
-async fn limit_100_per_hour_by_id(
-    Limit((uri, Path(Data { name, .. }))): LimitPerHour<100, (Uri, Id)>,
-) {
-    println!("{uri}, {name}");
-}
-async fn limit_10000_per_day_by_id(
-    Limit((_uri, Path(Data { id, .. }))): LimitPerDay<10000, (Uri, Id)>,
-) {
-    println!("id: {id:?}");
-}
+async fn limit_100_per_hour_by_id(_: LimitPerHour<100, (Uri, Id)>) {}
+async fn limit_10000_per_day_by_id(_: LimitPerDay<10000, (Uri, Id)>) {}
 
 #[derive(Debug, Deserialize)]
 struct Data {
     id: Id,
-    name: String,
+    _name: String,
 }
 
 #[derive(Deserialize, Clone, Copy, Hash, Ord, PartialOrd, Eq, PartialEq, Debug)]
@@ -77,5 +69,11 @@ impl Key for Id {
 
     fn from_extractor(extractor: &Self::Extractor) -> Self {
         extractor.id
+    }
+}
+
+impl StorageKey for Id {
+    fn storage_key(&self) -> String {
+        self.0.to_string()
     }
 }

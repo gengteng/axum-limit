@@ -1,10 +1,9 @@
 use super::fixed_window::FixedWindowState;
 use super::sliding_window::SlidingWindowState;
 use super::token_bucket::TokenBucketState;
-use super::RateLimitState;
+use super::PolicyState;
 use crate::quota::Quota;
 use proptest::prelude::*;
-use std::time::{Duration, Instant};
 
 fn monotonic_offsets(max_events: usize, max_step_ms: u64) -> impl Strategy<Value = Vec<u64>> {
     prop::collection::vec(0u64..max_step_ms, 1..max_events).prop_map(|deltas| {
@@ -19,9 +18,7 @@ fn monotonic_offsets(max_events: usize, max_step_ms: u64) -> impl Strategy<Value
     })
 }
 
-fn at(base: Instant, ms: u64) -> Instant {
-    base + Duration::from_millis(ms)
-}
+const BASE_MS: u64 = 10_000_000;
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
@@ -34,11 +31,10 @@ proptest! {
     ) {
         let burst = burst.max(max);
         let quota = Quota::with_burst(max, 1000, burst);
-        let start = Instant::now();
-        let mut state = TokenBucketState::new_at(quota, start);
+        let mut state = TokenBucketState::new_at(quota, BASE_MS);
 
         for offset in offsets {
-            let snapshot = state.try_acquire(at(start, offset));
+            let snapshot = state.try_acquire(BASE_MS + offset);
             prop_assert!(snapshot.remaining <= snapshot.limit);
             prop_assert_eq!(snapshot.limit, burst);
         }
@@ -52,12 +48,11 @@ proptest! {
     ) {
         let burst = burst.max(max);
         let quota = Quota::with_burst(max, 1000, burst);
-        let start = Instant::now();
-        let mut state = TokenBucketState::new_at(quota, start);
+        let mut state = TokenBucketState::new_at(quota, BASE_MS);
 
         let mut allowed = 0usize;
         for _ in 0..burst.saturating_add(extra) {
-            if state.try_acquire(start).allowed {
+            if state.try_acquire(BASE_MS).allowed {
                 allowed += 1;
             }
         }
@@ -72,11 +67,10 @@ proptest! {
         offsets in monotonic_offsets(80, 200),
     ) {
         let quota = Quota::new(max, per_ms);
-        let start = Instant::now();
-        let mut state = FixedWindowState::new_at(quota, start);
+        let mut state = FixedWindowState::new_at(quota, BASE_MS);
 
         for offset in offsets {
-            let snapshot = state.try_acquire(at(start, offset));
+            let snapshot = state.try_acquire(BASE_MS + offset);
             prop_assert!(snapshot.remaining <= snapshot.limit);
             prop_assert_eq!(snapshot.limit, max.max(1));
         }
@@ -89,12 +83,11 @@ proptest! {
         extra in 0usize..10,
     ) {
         let quota = Quota::new(max, per_ms);
-        let start = Instant::now();
-        let mut state = FixedWindowState::new_at(quota, start);
+        let mut state = FixedWindowState::new_at(quota, BASE_MS);
 
         let mut allowed = 0usize;
         for _ in 0..max.saturating_add(extra) {
-            if state.try_acquire(start).allowed {
+            if state.try_acquire(BASE_MS).allowed {
                 allowed += 1;
             }
         }
@@ -109,11 +102,10 @@ proptest! {
         offsets in monotonic_offsets(80, 200),
     ) {
         let quota = Quota::new(max, per_ms);
-        let start = Instant::now();
-        let mut state = SlidingWindowState::new_at(quota, start);
+        let mut state = SlidingWindowState::new_at(quota, BASE_MS);
 
         for offset in offsets {
-            let snapshot = state.try_acquire(at(start, offset));
+            let snapshot = state.try_acquire(BASE_MS + offset);
             prop_assert!(snapshot.remaining <= snapshot.limit);
             prop_assert_eq!(snapshot.limit, max.max(1));
         }
@@ -126,12 +118,11 @@ proptest! {
         extra in 0usize..10,
     ) {
         let quota = Quota::new(max, per_ms);
-        let start = Instant::now();
-        let mut state = SlidingWindowState::new_at(quota, start);
+        let mut state = SlidingWindowState::new_at(quota, BASE_MS);
 
         let mut allowed = 0usize;
         for _ in 0..max.saturating_add(extra) {
-            if state.try_acquire(start).allowed {
+            if state.try_acquire(BASE_MS).allowed {
                 allowed += 1;
             }
         }
