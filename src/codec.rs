@@ -22,8 +22,6 @@ pub(crate) fn encode_json<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, Cod
     serde_json::to_vec(value).map_err(|error| CodecError::InvalidPayload(error.to_string()))
 }
 
-pub(crate) fn decode_json<T: serde::de::DeserializeOwned>(
-    bytes: &[u8],
-) -> Result<T, CodecError> {
+pub(crate) fn decode_json<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecError> {
     serde_json::from_slice(bytes).map_err(|error| CodecError::InvalidPayload(error.to_string()))
 }

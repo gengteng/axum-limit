@@ -54,8 +54,7 @@ impl RateLimitBackend for MemoryBackend {
         let entry = self.states.entry(storage_key.to_string());
         match entry {
             dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
-                let (encoded, snapshot) =
-                    apply_policy::<P>(Some(occupied.get()), quota, now_ms)?;
+                let (encoded, snapshot) = apply_policy::<P>(Some(occupied.get()), quota, now_ms)?;
                 *occupied.get_mut() = encoded;
                 Ok(snapshot)
             }

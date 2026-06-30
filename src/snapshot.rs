@@ -46,11 +46,7 @@ impl RateLimitSnapshot {
         );
 
         if !self.allowed {
-            insert_header(
-                &mut headers,
-                RETRY_AFTER,
-                self.retry_after_secs(now_ms),
-            );
+            insert_header(&mut headers, RETRY_AFTER, self.retry_after_secs(now_ms));
         }
 
         headers

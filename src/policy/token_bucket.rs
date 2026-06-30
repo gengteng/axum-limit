@@ -56,7 +56,9 @@ impl TokenBucketState {
         if self.tokens > 0 {
             now_ms
         } else {
-            now_ms.saturating_add(self.ns_per_token / 1_000_000).max(now_ms + 1)
+            now_ms
+                .saturating_add(self.ns_per_token / 1_000_000)
+                .max(now_ms + 1)
         }
     }
 }
@@ -154,8 +156,7 @@ mod tests {
     fn round_trips_through_json() {
         let state = bucket(Quota::new(5, 1000));
         let encoded = state.encode().expect("encode");
-        let decoded =
-            TokenBucketState::decode(&encoded, Quota::new(5, 1000)).expect("decode");
+        let decoded = TokenBucketState::decode(&encoded, Quota::new(5, 1000)).expect("decode");
         assert_eq!(decoded.tokens, state.tokens);
     }
 }

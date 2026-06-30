@@ -19,11 +19,11 @@ use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use time::now_ms;
 
+#[cfg(feature = "redis")]
+pub use backend::RedisBackend;
 pub use backend::{
     apply_policy, build_storage_key, BackendError, MemoryBackend, RateLimitBackend, StorageKey,
 };
-#[cfg(feature = "redis")]
-pub use backend::RedisBackend;
 pub use codec::CodecError;
 pub use policy::{
     FixedWindowPolicy, PolicyState, RateLimitPolicy, SlidingWindowPolicy, TokenBucketPolicy,
@@ -261,19 +261,12 @@ where
     }
 
     /// Checks and updates the rate limit for the given key.
-    pub async fn check(
-        &self,
-        key: K,
-        quota: Quota,
-    ) -> Result<RateLimitSnapshot, B::Error>
+    pub async fn check(&self, key: K, quota: Quota) -> Result<RateLimitSnapshot, B::Error>
     where
         K: StorageKey,
     {
-        let storage_key = build_storage_key::<P>(
-            self.backend.namespace(),
-            &key.storage_key(),
-            quota,
-        );
+        let storage_key =
+            build_storage_key::<P>(self.backend.namespace(), &key.storage_key(), quota);
         self.backend
             .transact::<P>(&storage_key, quota, now_ms())
             .await
@@ -502,8 +495,20 @@ mod tests {
         let quota_a = Quota::new(1, 1000);
         let quota_b = Quota::new(5, 1000);
 
-        assert!(state.check(uri.clone(), quota_a).await.expect("check").allowed);
-        assert!(!state.check(uri.clone(), quota_a).await.expect("check").allowed);
+        assert!(
+            state
+                .check(uri.clone(), quota_a)
+                .await
+                .expect("check")
+                .allowed
+        );
+        assert!(
+            !state
+                .check(uri.clone(), quota_a)
+                .await
+                .expect("check")
+                .allowed
+        );
         assert!(state.check(uri, quota_b).await.expect("check").allowed);
     }
 

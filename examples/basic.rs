@@ -2,8 +2,8 @@ use axum::extract::Path;
 use axum::routing::get;
 use axum::Router;
 use axum_limit::{
-    FixedWindowPerSecond, FixedWindowPolicy, Key, Limit, LimitPerDay, LimitPerHour,
-    LimitPerSecond, LimitState, SlidingWindowPerSecond, SlidingWindowPolicy, StorageKey,
+    FixedWindowPerSecond, FixedWindowPolicy, Key, Limit, LimitPerDay, LimitPerHour, LimitPerSecond,
+    LimitState, SlidingWindowPerSecond, SlidingWindowPolicy, StorageKey,
 };
 use http::{Method, Uri};
 use serde::Deserialize;
